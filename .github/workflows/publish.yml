@@ -1,0 +1,236 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish, without the v prefix
+        required: true
+        type: string
+      build_run_id:
+        description: Successful Build Release Artifact run ID
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish to TestPyPI and create Release
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - name: Require main workflow dispatch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: test "$DISPATCH_REF" = refs/heads/main
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-dist
+          path: release/
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify build identity and artifact binding
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh api "/repos/$REPOSITORY/actions/runs/$INPUT_BUILD_RUN_ID" > /tmp/build-run.json
+          BUILD_SHA=$(python -c 'import json; print(json.load(open("/tmp/build-run.json"))["head_sha"])')
+          gh api "/repos/$REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$BUILD_SHA&event=push&status=completed" > /tmp/ci-runs.json
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          run = json.load(open("/tmp/build-run.json"))
+          expected = {
+              "name": "Build Release Artifact",
+              "path": ".github/workflows/build.yml",
+              "event": "push",
+              "head_branch": "main",
+              "status": "completed",
+              "conclusion": "success",
+          }
+          for field, value in expected.items():
+              if run.get(field) != value:
+                  raise SystemExit(f"build run {field} mismatch: {run.get(field)!r}")
+          ci_runs = json.load(open("/tmp/ci-runs.json")).get("workflow_runs", [])
+          if not any(
+              item.get("head_sha") == run["head_sha"]
+              and item.get("head_branch") == "main"
+              and item.get("event") == "push"
+              and item.get("conclusion") == "success"
+              for item in ci_runs
+          ):
+              raise SystemExit("release commit has no successful CI push run")
+          command = [
+              "python",
+              "scripts/release_artifacts.py",
+              "verify",
+              "--dist", "release/dist",
+              "--manifest", "release/metadata/manifest.json",
+              "--version", os.environ["INPUT_VERSION"],
+              "--head-sha", run["head_sha"],
+              "--build-run-id", os.environ["INPUT_BUILD_RUN_ID"],
+              "--repository", os.environ["REPOSITORY"],
+              "--workflow", "build.yml",
+          ]
+          subprocess.run(command, check=True)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"release_commit={run['head_sha']}\n")
+          PY
+      - name: Checkout immutable release commit and verify source version
+        env:
+          RELEASE_COMMIT: ${{ steps.verify.outputs.release_commit }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          git fetch origin "$RELEASE_COMMIT"
+          git checkout --detach "$RELEASE_COMMIT"
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          root = pathlib.Path.cwd()
+          source = (root / "src/codelux/__init__.py").read_text()
+          declared = tomllib.loads((root / "pyproject.toml").read_text())["tool"]["poetry"]["version"]
+          expected = os.environ["INPUT_VERSION"]
+          if declared != expected or f'__version__ = "{expected}"' not in source:
+              raise SystemExit("source version does not match requested release")
+          PY
+      - name: Create or verify draft Release and protected tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.verify.outputs.release_commit }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          TAG="v$INPUT_VERSION"
+          cat > /tmp/release-notes.md <<EOF
+          ## English
+
+          Codelux $INPUT_VERSION alpha release.
+
+          Commit: $RELEASE_COMMIT
+          Build run: ${{ inputs.build_run_id }}
+
+          ## 简体中文
+
+          Codelux $INPUT_VERSION Alpha 版本。
+
+          Commit: $RELEASE_COMMIT
+          Build run: ${{ inputs.build_run_id }}
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            EXISTING_SHA=$(git ls-remote --tags origin "refs/tags/$TAG" | awk '{print $1}')
+            test "$EXISTING_SHA" = "$RELEASE_COMMIT"
+          else
+            gh release create "$TAG" \
+              --target "$RELEASE_COMMIT" \
+              --draft \
+              --prerelease \
+              --title "$TAG" \
+              --notes-file /tmp/release-notes.md
+          fi
+      - name: Check existing TestPyPI artifact hashes
+        id: testpypi
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          from urllib.error import HTTPError
+          from urllib.request import urlopen
+
+          from scripts.release_artifacts import compare_remote_artifacts
+
+          version = os.environ["INPUT_VERSION"]
+          try:
+              with urlopen(f"https://test.pypi.org/pypi/codelux/{version}/json") as response:
+                  remote = json.load(response)
+          except HTTPError as exc:
+              if exc.code != 404:
+                  raise
+              remote = None
+          hashes = (
+              {}
+              if remote is None
+              else {item["filename"]: item["digests"]["sha256"] for item in remote["urls"]}
+          )
+          dist = Path("release/dist")
+          missing = compare_remote_artifacts(dist, hashes, allow_missing=True)
+          upload = Path("release/upload-dist")
+          upload.mkdir()
+          for path in missing:
+              shutil.copyfile(path, upload / path.name)
+          needs_upload = any(upload.iterdir())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"needs_upload={str(needs_upload).lower()}\n")
+          PY
+      - name: Publish immutable artifacts to TestPyPI
+        if: steps.testpypi.outputs.needs_upload == 'true'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: release/upload-dist/
+          verbose: true
+      - name: Verify TestPyPI hashes
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from urllib.request import urlopen
+
+          from scripts.release_artifacts import compare_remote_artifacts
+
+          with urlopen(f"https://test.pypi.org/pypi/codelux/{os.environ['INPUT_VERSION']}/json") as response:
+              remote = json.load(response)
+          hashes = {item["filename"]: item["digests"]["sha256"] for item in remote["urls"]}
+          compare_remote_artifacts(Path("release/dist"), hashes, allow_missing=False)
+          PY
+            then exit 0; fi
+            sleep $((attempt * 5))
+          done
+          exit 1
+      - name: Upload and verify GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          TAG="v$INPUT_VERSION"
+          for file in release/dist/* release/metadata/*; do
+            name=$(basename "$file")
+            if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -Fxq "$name"; then
+              mkdir -p /tmp/release-assets
+              gh release download "$TAG" --pattern "$name" --dir /tmp/release-assets
+              cmp "$file" "/tmp/release-assets/$name"
+            else
+              gh release upload "$TAG" "$file"
+            fi
+          done
+      - name: Publish GitHub Release last
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          TAG="v$INPUT_VERSION"
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ]; then
+            gh release edit "$TAG" --draft=false
+          fi
