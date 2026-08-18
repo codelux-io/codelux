@@ -16,7 +16,7 @@ ALLOWED_ROOT_FILES = {
     "pyproject.toml",
 }
 ALLOWED_ROOT_DIRS = {".github", "scripts", "src", "tests"}
-ALLOWED_WORKFLOWS = {"build.yml", "ci.yml", "publish.yml"}
+ALLOWED_WORKFLOWS = {"build.yml", "ci.yml", "publish.yml", "publish-pypi.yml"}
 ALLOWED_SCRIPTS = {"check_public_repository.py", "release_artifacts.py"}
 ALLOWED_COMMIT_IDENTITIES = {
     ("codelux-ai-dev", "316519841+codelux-ai-dev@users.noreply.github.com"),

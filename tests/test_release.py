@@ -15,6 +15,7 @@ from codelux import __version__
 
 ROOT = Path(__file__).parents[1]
 SCRIPT_PATH = ROOT / "scripts/release_artifacts.py"
+PYPI_WORKFLOW_PATH = ROOT / ".github/workflows/publish-pypi.yml"
 SPEC = importlib.util.spec_from_file_location("release_artifacts", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 release_artifacts = importlib.util.module_from_spec(SPEC)
@@ -32,6 +33,16 @@ POLICY_SPEC.loader.exec_module(public_policy)
 def test_package_versions_match() -> None:
     metadata = tomllib.loads((ROOT / "pyproject.toml").read_text())
     assert metadata["tool"]["poetry"]["version"] == __version__
+
+
+def test_pypi_workflow_is_production_only() -> None:
+    workflow = PYPI_WORKFLOW_PATH.read_text()
+    assert "environment: production" in workflow
+    assert "https://upload.pypi.org/legacy/" in workflow
+    assert "test.pypi.org" not in workflow
+    assert "gh release" not in workflow
+    assert "contents: read" in workflow
+    assert "contents: write" not in workflow
 
 
 @pytest.mark.parametrize(
