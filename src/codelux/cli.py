@@ -974,7 +974,15 @@ def add_provider(name: str, url: Optional[str], client: str, key_stdin: bool) ->
         if adapters[target].is_running() is not ProcessState.NOT_RUNNING:
             raise ValidationError(f"{target} is running or process state is unknown")
         observed = adapters[target].inspect()
-        if observed.state in {ConfigState.UNKNOWN, ConfigState.EXTERNAL_OVERRIDE}:
+        fresh_codex_install = (
+            target == "codex"
+            and not adapters[target].config_path.exists()
+            and not adapters[target].auth_path.exists()
+        )
+        if (
+            observed.state in {ConfigState.UNKNOWN, ConfigState.EXTERNAL_OVERRIDE}
+            and not fresh_codex_install
+        ):
             raise ValidationError(f"{target} configuration is {observed.state.value}")
         if url is None:
             url = str(click.prompt(f"{target} base URL", type=str))

@@ -48,6 +48,23 @@ def _claude_home(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def test_add_allows_fresh_codex_install(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(CodexAdapter, "is_installed", lambda self: True)
+    monkeypatch.setattr(CodexAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    result = CliRunner().invoke(
+        main,
+        ["add", "proxy", "--url", "https://proxy.example", "--client", "codex"],
+        input="codex-secret\ncodex-secret\n",
+        env={"CODELUX_TEST_HOME": str(tmp_path)},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "added and activated proxy for codex" in result.output
+    assert (tmp_path / ".codex/config.toml").is_file()
+    assert json.loads((tmp_path / ".codex/auth.json").read_text())["auth_mode"] == "apikey"
+    assert "proxy" in (tmp_path / ".codex/config.toml").read_text()
+
+
 def test_cli_add_list_switch_and_restore_official(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
     home = _claude_home(tmp_path)
