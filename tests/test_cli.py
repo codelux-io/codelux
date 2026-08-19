@@ -49,6 +49,7 @@ def _claude_home(tmp_path: Path) -> Path:
 
 
 def test_add_allows_fresh_codex_install(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(CodexAdapter, "is_installed", lambda self: True)
     monkeypatch.setattr(CodexAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
     result = CliRunner().invoke(
         main,
