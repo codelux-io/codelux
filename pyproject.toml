@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "codelux"
-version = "0.1.0a2"
+version = "0.1.0a3"
 description = "Unified Provider management CLI for AI coding assistants"
 authors = ["Codelux AI Initiative"]
 license = "MIT"
