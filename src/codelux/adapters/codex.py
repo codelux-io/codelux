@@ -182,7 +182,10 @@ class CodexAdapter(ClientAdapter):
     ) -> PreparedChange:
         config, config_raw, _ = self._read_config()
         auth, auth_raw, _ = self._read_auth()
-        if config is None or auth is None:
+        fresh_install = not self.config_path.exists() and not self.auth_path.exists()
+        if fresh_install:
+            config, config_raw, auth, auth_raw = {}, b"", {}, b""
+        elif config is None or auth is None:
             raise ValidationError("Codex configuration is not readable")
         logical_provider_id = binding.get("provider_id", binding.get("name", "custom"))
         if not isinstance(logical_provider_id, str):

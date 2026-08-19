@@ -65,6 +65,24 @@ def test_missing_provider_table_is_created_preserving_existing_content(tmp_path:
     assert "[model_providers.proxy]" in text
 
 
+def test_fresh_codex_install_can_prepare_provider(tmp_path: Path) -> None:
+    change = CodexAdapter(tmp_path).prepare_provider(
+        {
+            "provider_id": "proxy",
+            "base_url": "https://proxy.example",
+            "api_key": "new-secret",
+            "wire_api": "responses",
+            "requires_openai_auth": True,
+        }
+    )
+
+    config = next(file.content for file in change.after if file.path.name == "config.toml").decode()
+    auth = json.loads(next(file.content for file in change.after if file.path.name == "auth.json"))
+    assert 'model_provider = "proxy"' in config
+    assert "[model_providers.proxy]" in config
+    assert auth == {"OPENAI_API_KEY": "new-secret", "auth_mode": "apikey"}
+
+
 def test_codex_custom_patch_preserves_unowned_text(tmp_path: Path) -> None:
     config_dir = tmp_path / ".codex"
     config_dir.mkdir()
