@@ -43,6 +43,18 @@ def test_process_check_detects_node_and_vendor_codex(monkeypatch, tmp_path: Path
     assert adapter.is_running() is ProcessState.RUNNING
 
 
+def test_process_check_is_unknown_when_process_list_is_unavailable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    adapter = CodexAdapter(tmp_path, _registry())
+
+    def unavailable(*args, **kwargs):
+        raise OSError("process list unavailable")
+
+    monkeypatch.setattr(subprocess, "run", unavailable)
+    assert adapter.is_running() is ProcessState.UNKNOWN
+
+
 def test_missing_provider_table_is_created_preserving_existing_content(tmp_path: Path) -> None:
     home = tmp_path
     codex = home / ".codex"
