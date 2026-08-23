@@ -2,12 +2,12 @@
 """Generate and verify immutable Codelux release artifact metadata."""
 
 import argparse
-from datetime import datetime, timezone
 import hashlib
 import json
+from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence
-
+from typing import Any, Optional
 
 SCHEMA_VERSION = 1
 

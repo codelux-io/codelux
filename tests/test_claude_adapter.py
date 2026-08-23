@@ -62,6 +62,18 @@ def test_process_check_ignores_client_name_in_arguments(monkeypatch, tmp_path: P
     assert adapter.is_running() is ProcessState.NOT_RUNNING
 
 
+def test_process_check_is_unknown_when_process_list_is_unavailable(
+    monkeypatch, tmp_path: Path
+) -> None:
+    adapter = ClaudeAdapter(tmp_path)
+
+    def unavailable(*args, **kwargs):
+        raise OSError("process list unavailable")
+
+    monkeypatch.setattr(subprocess, "run", unavailable)
+    assert adapter.is_running() is ProcessState.UNKNOWN
+
+
 def test_claude_official_api_key_state(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)

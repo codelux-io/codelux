@@ -1,12 +1,12 @@
 """Provider registry schema and validation."""
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from codelux.errors import ValidationError
-
 
 PROVIDER_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 RESERVED_NAMES = {

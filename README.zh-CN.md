@@ -121,6 +121,11 @@ codelux sync push --ssh user@host.example --providers
 codelux sync pull --ssh user@host.example --providers
 ```
 
+同步 Claude Code 或 Codex 会话历史时，请输入目标机器上的真实绝对项目目录。在 macOS 和
+Linux 上，最可靠的方式是在目标项目中运行 `pwd` 并粘贴输出。不要输入
+`-Users-user-work-project` 这类 Claude Code 内部存储键；Codelux 会自动生成该键。本地 pull
+目标和远端 push 目标都必须已经存在且是目录。未选择同步会话的客户端不需要停止。
+
 可以对任意命令使用 `--help` 查看当前选项和安全提示。
 
 ## 当前支持的系统环境

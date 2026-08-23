@@ -1,8 +1,8 @@
 """Shared adapter interface."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Mapping
 
 from codelux.models import ConfigFile, ObservedConfig, PreparedChange, ProcessState
 

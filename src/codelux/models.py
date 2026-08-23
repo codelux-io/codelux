@@ -4,11 +4,12 @@ These models deliberately contain no filesystem or client-specific behavior.
 Adapters and the transaction coordinator build on these stable contracts.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 
 class ConfigState(str, Enum):
