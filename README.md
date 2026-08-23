@@ -121,6 +121,13 @@ Synchronize selected Provider state from another machine over SSH:
 codelux sync pull --ssh user@host.example --providers
 ```
 
+When synchronizing Claude Code or Codex session history, enter the real absolute project directory
+on the target machine. The most reliable method on macOS and Linux is to run `pwd` inside that
+project and paste its output. Do not enter Claude Code's internal storage key, such as
+`-Users-user-work-project`; Codelux generates that key automatically. Local pull targets and remote
+push targets must already exist and be directories. A client that is not selected for session
+synchronization does not need to be stopped.
+
 Use `--help` on any command to inspect its current options and safety prompts.
 
 ## Supported environments

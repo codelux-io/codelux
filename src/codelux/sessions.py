@@ -4,13 +4,13 @@ import json
 import os
 import sqlite3
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable, Optional, Set
+from typing import Optional, Set
 
 from codelux.errors import ValidationError
 from codelux.models import ConfigFile, SessionChange
 from codelux.safe_files import atomic_write_private
-
 
 SHARED_PROVIDER = "custom"
 
@@ -147,9 +147,8 @@ class CodexSessionManager:
         os.close(fd)
         temp = Path(name)
         try:
-            with sqlite3.connect(temp) as target:
-                with sqlite3.connect(path) as source:
-                    source.backup(target)
+            with sqlite3.connect(temp) as target, sqlite3.connect(path) as source:
+                source.backup(target)
             return temp.read_bytes()
         finally:
             temp.unlink(missing_ok=True)

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+import codelux.sync as sync_module
+from codelux import sync_transport
 from codelux.errors import ValidationError
 from codelux.models import FileState, OperationState, ProcessState
 from codelux.snapshots import SnapshotStore
@@ -28,14 +30,12 @@ from codelux.sync import (
     select_claude_projects,
     select_codex_projects,
 )
-import codelux.sync as sync_module
-import codelux.sync_transport as sync_transport
 from codelux.sync_transport import (
     Capability,
     canonical_line,
     local_capability,
-    pull_archive,
     parse_plain_archive,
+    pull_archive,
     push_archive,
     read_capability,
     ssh_command,

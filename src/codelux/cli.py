@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, Optional, TypedDict, TypeVar
 
 import click
+
 from codelux import __version__
 from codelux.adapters import ClaudeAdapter, CodexAdapter
 from codelux.coordinator import TransactionCoordinator
@@ -42,11 +43,11 @@ from codelux.sync import (
     map_claude_sessions,
     map_codex_sessions,
     materialize_sync_files,
+    reset_baseline,
+    rotate_machine_id,
     select_claude_project,
     select_claude_projects,
     select_codex_projects,
-    reset_baseline,
-    rotate_machine_id,
 )
 from codelux.sync_transport import (
     canonical_line,
@@ -56,7 +57,6 @@ from codelux.sync_transport import (
     push_archive,
     validate_capability,
 )
-
 
 F = TypeVar("F", bound=Callable[..., None])
 
@@ -75,7 +75,6 @@ class ProviderListRow(TypedDict):
 @click.version_option(version=__version__, prog_name="codelux")
 def main() -> None:
     """Main CLI entry point."""
-    pass
 
 
 @main.command()
@@ -213,7 +212,76 @@ def _session_overwrite_prompts(clients: tuple[str, ...], forced: bool) -> tuple[
     return tuple(approved)
 
 
-def _codex_project_mapping(files: dict[str, bytes]) -> dict[str, Path]:
+def _project_directory(value: object, *, local: bool) -> Path:
+    path = Path(str(value))
+    if not path.is_absolute():
+        raise ValidationError(
+            "project directory must be a real absolute path; run pwd in the project "
+            "on the target machine and paste its output"
+        )
+    path = Path(os.path.abspath(path))
+    if local and not path.is_dir():
+        raise ValidationError(
+            f"local project directory does not exist or is not a directory: {path}"
+        )
+    return path
+
+
+def _claude_source_project(files: dict[str, bytes], slug: str) -> Optional[str]:
+    prefix = f"claude/projects/{slug}/"
+    for logical, content in sorted(files.items()):
+        if not logical.startswith(prefix) or not logical.endswith(".jsonl"):
+            continue
+        for raw_line in content.splitlines():
+            try:
+                record = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                cwd = record.get("cwd")
+                if isinstance(cwd, str):
+                    return cwd
+    return None
+
+
+def _session_project_directories(files: dict[str, bytes]) -> tuple[Path, ...]:
+    roots = {
+        Path(project)
+        for logical in files
+        if logical.startswith("claude/projects/")
+        for slug in (logical.split("/", 3)[2],)
+        for project in (_claude_source_project(files, slug),)
+        if project is not None
+    }
+    roots.update(Path(project) for project in codex_session_projects(files))
+    has_claude_history = any(path.startswith("claude/projects/") for path in files)
+    if has_claude_history and not any(
+        _claude_source_project(files, path.split("/", 3)[2]) is not None
+        for path in files
+        if path.startswith("claude/projects/")
+    ):
+        raise ValidationError("Claude session history does not identify a real project path")
+    return tuple(sorted(roots, key=str))
+
+
+def _claude_source_slug(files: dict[str, bytes], slugs: list[str], selected_path: str) -> str:
+    source_path = _project_directory(selected_path, local=False)
+    matches = [slug for slug in slugs if _claude_source_project(files, slug) == str(source_path)]
+    if len(matches) != 1:
+        raise ValidationError("unknown or ambiguous Claude source project path")
+    return matches[0]
+
+
+def _prompt_project_directory(label: str, *, local: bool) -> Optional[Path]:
+    value = click.prompt(
+        f"{label} (enter a real absolute path; Enter to skip)",
+        default="",
+        show_default=False,
+    )
+    return _project_directory(value, local=local) if value else None
+
+
+def _codex_project_mapping(files: dict[str, bytes], *, local: bool = False) -> dict[str, Path]:
     projects = codex_session_projects(files)
     if not projects:
         return {}
@@ -222,14 +290,11 @@ def _codex_project_mapping(files: dict[str, bytes]) -> dict[str, Path]:
     )
     mappings = {}
     for project in projects:
-        value = click.prompt(
-            f"Target project directory for Codex session history {project} "
-            "(Enter to skip this project's history)",
-            default="",
-            show_default=False,
+        target = _prompt_project_directory(
+            f"Target project directory for Codex source project {project}", local=local
         )
-        if value:
-            mappings[project] = Path(value).expanduser().absolute()
+        if target is not None:
+            mappings[project] = target
     return mappings
 
 
@@ -243,7 +308,8 @@ def _codex_project_mapping(files: dict[str, bytes]) -> dict[str, Path]:
     help="Target project root for Claude session history.",
 )
 @click.option(
-    "--claude-source-project", help="Source Claude project slug to map when syncing one project."
+    "--claude-source-project",
+    help="Real absolute source Claude project path to map when syncing one project.",
 )
 @click.option(
     "--apply-active-provider",
@@ -270,24 +336,59 @@ def sync_import(
             "Replace the target active Provider configuration?", default=False
         ):
             raise ValidationError("target active Provider replacement was not confirmed")
-        if claude_source_project is not None:
-            if claude_project_root is None:
+        source_slugs = sorted(
+            {
+                entry.path.split("/", 3)[2]
+                for entry in manifest.files
+                if entry.path.startswith("claude/projects/")
+            }
+        )
+        claude_roots = {}
+        if source_slugs and claude_project_root is not None:
+            if claude_source_project is not None:
+                source_slug = _claude_source_slug(files, source_slugs, claude_source_project)
+            elif len(source_slugs) == 1:
+                source_slug = source_slugs[0]
+            else:
+                raise ValidationError(
+                    "multiple Claude projects require --claude-source-project or interactive mappings"
+                )
+            target_root = _project_directory(claude_project_root, local=True)
+            manifest, files = select_claude_project(manifest, files, source_slug)
+            claude_roots[source_slug] = target_root
+        elif source_slugs:
+            if claude_source_project is not None:
                 raise ValidationError("--claude-source-project requires --claude-project-root")
-            manifest, files = select_claude_project(manifest, files, claude_source_project)
+            click.echo(
+                "Claude Code project history must be mapped using real local project paths; "
+                "storage keys are generated automatically."
+            )
+            for slug in source_slugs:
+                source = _claude_source_project(files, slug)
+                source_label = source or f"unknown path (storage key: {slug})"
+                prompted_root = _prompt_project_directory(
+                    f"Local project directory for Claude source project {source_label}",
+                    local=True,
+                )
+                if prompted_root is not None:
+                    claude_roots[slug] = prompted_root
+            manifest, files = select_claude_projects(manifest, files, tuple(claude_roots))
+        if claude_roots:
+            manifest, files = map_claude_sessions(manifest, files, claude_roots)
         codex_roots = (
-            _codex_project_mapping(files)
+            _codex_project_mapping(files, local=True)
             if any(entry.path.startswith("codex/") for entry in manifest.files)
             else {}
         )
         if any(entry.path.startswith("codex/") for entry in manifest.files):
             manifest, files = select_codex_projects(manifest, files, tuple(codex_roots))
-        _sync_process_preflight(manifest.selection)
+        _sync_process_preflight(manifest.selection, _manifest_clients(manifest))
         missing = apply_import(
             _home(),
             manifest,
             files,
             overwrite,
-            claude_project_root,
+            None,
             codex_project_roots=codex_roots,
         )
         payload = {"transfer_id": manifest.transfer_id, "files": sorted(files), "missing": missing}
@@ -314,7 +415,8 @@ def sync_import(
     help="Target project root for Claude session history.",
 )
 @click.option(
-    "--claude-source-project", help="Source Claude project slug to map when syncing one project."
+    "--claude-source-project",
+    help="Real absolute source Claude project path to map when syncing one project.",
 )
 @click.option(
     "--no-incremental",
@@ -343,17 +445,19 @@ def sync_push(
         if not selected:
             click.echo("No content selected; synchronization cancelled.")
             return
-        _sync_process_preflight(selected)
+        _sync_process_preflight(selected, session_clients)
         click.echo("[1/6] Checking source Codelux state...")
         registry_backup = _standardize_sync_source(selected)
-        _ensure_sync_source_healthy(selected)
+        _ensure_sync_source_healthy(selected, session_clients)
         target = ssh_target or str(click.prompt("SSH target (user@host)"))
         if claude_project_root is not None:
-            claude_project_root = claude_project_root.expanduser().absolute()
+            claude_project_root = _project_directory(claude_project_root, local=False)
         click.echo("[2/6] Collecting source files...")
         manifest, files = build_manifest(_home(), selected, keys, clients=session_clients)
         manifest, payload = materialize_sync_files(manifest, files)
         if "sessions" in selected:
+            project_roots: dict[str, Path] = {}
+            codex_roots: dict[str, Path] = {}
             source_slugs = sorted(
                 {
                     entry.path.split("/", 3)[2]
@@ -362,25 +466,25 @@ def sync_push(
                 }
             )
             if source_slugs:
-                project_roots = {}
                 if claude_project_root is not None:
                     selected_source = claude_source_project
                     if len(source_slugs) > 1 and not selected_source:
                         click.echo("Available Claude projects:")
                         for index, slug in enumerate(source_slugs, 1):
-                            click.echo(f"  {index}. {slug}")
-                        click.echo("Select one project by entering its number or exact slug.")
-                        selection = str(
-                            click.prompt(f"Selection (for example, 1 or {source_slugs[0]})")
-                        )
+                            source = _claude_source_project(payload, slug)
+                            click.echo(f"  {index}. {source or 'source path unavailable'}")
+                        click.echo("Select one project by entering its number or real source path.")
+                        selection = str(click.prompt("Selection (for example, 1)"))
                         if selection.isdigit() and 1 <= int(selection) <= len(source_slugs):
                             selected_source = source_slugs[int(selection) - 1]
-                        elif selection in source_slugs:
-                            selected_source = selection
                         else:
-                            raise ValidationError(
-                                "select a listed project number or exact project slug"
-                            )
+                            selected_source = _claude_source_slug(payload, source_slugs, selection)
+                    elif selected_source:
+                        selected_source = _claude_source_slug(
+                            payload, source_slugs, selected_source
+                        )
+                    else:
+                        selected_source = source_slugs[0]
                     if selected_source not in source_slugs:
                         raise ValidationError("unknown Claude source project")
                     manifest, payload = select_claude_project(
@@ -392,24 +496,25 @@ def sync_push(
                     manifest, payload = map_claude_sessions(manifest, payload, project_roots)
                 else:
                     click.echo(
-                        "Claude Code project history is included only when mapped to a target project directory."
+                        "Claude Code project history must be mapped using real target project paths; "
+                        "storage keys are generated automatically."
                     )
                     selected_slugs = []
                     for slug in source_slugs:
-                        value = click.prompt(
-                            f"Target project directory for Claude Code project history {slug} "
-                            "(Enter to skip this project's history)",
-                            default="",
-                            show_default=False,
+                        source = _claude_source_project(payload, slug)
+                        source_label = source or f"unknown path (storage key: {slug})"
+                        target_root = _prompt_project_directory(
+                            f"Target project directory for Claude source project {source_label}",
+                            local=False,
                         )
-                        if not value:
+                        if target_root is None:
                             continue
                         selected_slugs.append(slug)
-                        project_roots[slug] = Path(value).expanduser().absolute()
+                        project_roots[slug] = target_root
                     manifest, payload = select_claude_projects(manifest, payload, selected_slugs)
                     manifest, payload = map_claude_sessions(manifest, payload, project_roots)
             if "codex" in session_clients:
-                codex_roots = _codex_project_mapping(payload)
+                codex_roots = _codex_project_mapping(payload, local=False)
                 manifest, payload = select_codex_projects(manifest, payload, tuple(codex_roots))
                 manifest, payload = map_codex_sessions(
                     manifest, payload, _home().absolute(), codex_roots
@@ -494,7 +599,7 @@ def sync_pull(
             click.echo("No content selected; synchronization cancelled.")
             return
         overwrite_clients = _session_overwrite_prompts(session_clients, overwrite)
-        _sync_process_preflight(selected)
+        _sync_process_preflight(selected, session_clients)
         target = ssh_target or str(click.prompt("SSH source (user@host)"))
         click.echo("[1/4] Checking local Codelux state...")
         capability, manifest, files = pull_archive(
@@ -519,23 +624,26 @@ def sync_pull(
                     raise ValidationError(
                         "multiple Claude projects require interactive target mappings"
                     )
-                claude_roots[source_slugs[0]] = claude_project_root.expanduser().absolute()
+                claude_roots[source_slugs[0]] = _project_directory(claude_project_root, local=True)
             else:
                 click.echo(
-                    "Claude Code project history must be mapped to local project directories."
+                    "Claude Code project history must be mapped using real local project paths; "
+                    "storage keys are generated automatically."
                 )
                 for slug in source_slugs:
-                    value = click.prompt(
-                        f"Local project directory for Claude Code project history {slug} "
-                        "(Enter to skip this project's history)",
-                        default="",
-                        show_default=False,
+                    source = _claude_source_project(files, slug)
+                    source_label = source or f"unknown path (storage key: {slug})"
+                    target_root = _prompt_project_directory(
+                        f"Local project directory for Claude source project {source_label}",
+                        local=True,
                     )
-                    if value:
-                        claude_roots[slug] = Path(value).expanduser().absolute()
+                    if target_root is not None:
+                        claude_roots[slug] = target_root
             manifest, files = select_claude_projects(manifest, files, tuple(claude_roots))
             manifest, files = map_claude_sessions(manifest, files, claude_roots)
-        codex_roots = _codex_project_mapping(files) if "codex" in session_clients else {}
+        codex_roots = (
+            _codex_project_mapping(files, local=True) if "codex" in session_clients else {}
+        )
         if "codex" in session_clients:
             manifest, files = select_codex_projects(manifest, files, tuple(codex_roots))
         click.echo(
@@ -564,12 +672,23 @@ def sync_pull(
         raise click.ClickException(str(exc)) from exc
 
 
-def _ensure_sync_source_healthy(selection: tuple[str, ...], clients: tuple[str, ...] = ()) -> None:
+def _manifest_clients(manifest: object) -> tuple[str, ...]:
+    files = getattr(manifest, "files", ())
+    return tuple(
+        name
+        for name in ("claude", "codex")
+        if any(getattr(entry, "path", "").startswith(f"{name}/") for entry in files)
+    )
+
+
+def _ensure_sync_source_healthy(
+    selection: tuple[str, ...], clients: Optional[tuple[str, ...]] = None
+) -> None:
     adapters, registry, _ = _adapters()
     names = [
         name for name in ("claude", "codex") if name in adapters and adapters[name].is_installed()
     ]
-    if clients:
+    if clients is not None:
         names = [name for name in names if name in clients]
     if "config" not in selection and "sessions" not in selection:
         return
@@ -646,7 +765,9 @@ def _standardize_sync_source(
     return backup
 
 
-def _sync_process_preflight(selection: tuple[str, ...], clients: tuple[str, ...] = ()) -> None:
+def _sync_process_preflight(
+    selection: tuple[str, ...], clients: Optional[tuple[str, ...]] = None
+) -> None:
     if not set(selection).intersection({"config", "sessions"}):
         return
     adapters, _, _ = _adapters()
@@ -659,7 +780,7 @@ def _sync_process_preflight(selection: tuple[str, ...], clients: tuple[str, ...]
         name
         for name, adapter in adapters.items()
         if installed[name]
-        and (not clients or name in clients)
+        and (clients is None or name in clients)
         and adapter.is_running() is not ProcessState.NOT_RUNNING
     ]
     if unsafe:
@@ -725,6 +846,9 @@ def sync_transport_receive(
         raw = sys.stdin.buffer.read()
         manifest, files = parse_plain_archive(raw)
         validate_capability(capability, manifest)
+        _sync_process_preflight(manifest.selection, _manifest_clients(manifest))
+        for project_path in _session_project_directories(files):
+            _project_directory(project_path, local=True)
         overwrite_policy = overwrite or {
             "claude": overwrite_claude,
             "codex": overwrite_codex,
@@ -777,8 +901,8 @@ def sync_transport_send(
         )
         if include_sessions and not clients:
             clients = ("claude", "codex")
-        _sync_process_preflight(selected)
-        _ensure_sync_source_healthy(selected)
+        _sync_process_preflight(selected, clients)
+        _ensure_sync_source_healthy(selected, clients)
         manifest, files = build_manifest(_home(), selected, keys, clients=clients or None)
         archive = create_plain_archive(manifest, files)
         output = sys.stdout.buffer
@@ -914,9 +1038,7 @@ def status(client: str, output_format: str) -> None:
             health = HealthState.HEALTHY
             if recovery_required:
                 health = HealthState.RECOVERY_REQUIRED
-            elif observed.state is ConfigState.UNKNOWN:
-                health = HealthState.DRIFTED
-            elif expected != observed_provider:
+            elif observed.state is ConfigState.UNKNOWN or expected != observed_provider:
                 health = HealthState.DRIFTED
             rows.append(
                 {

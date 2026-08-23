@@ -1,7 +1,8 @@
 """Cross-client transaction coordination."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping, Optional, Tuple
+from typing import Optional, Tuple
 
 from codelux.adapters.base import ClientAdapter
 from codelux.errors import CodeluxError, RecoveryRequiredError

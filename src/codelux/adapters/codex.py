@@ -6,8 +6,9 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from codelux.adapters.base import ClientAdapter, config_file
 from codelux.errors import ValidationError
@@ -15,7 +16,6 @@ from codelux.models import ConfigFile, ConfigState, ObservedConfig, PreparedChan
 from codelux.registry import Registry
 from codelux.safe_files import atomic_write_private
 from codelux.sessions import CodexSessionManager
-
 
 ROOT_ASSIGNMENT = re.compile(
     r"^(?P<indent>\s*)model_provider\s*=\s*(?P<value>\"[^\"]*\"|'[^']*')\s*$"

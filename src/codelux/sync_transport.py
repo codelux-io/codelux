@@ -3,9 +3,10 @@
 import io
 import json
 import subprocess
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Optional
 
 from codelux import __version__
 from codelux.errors import ValidationError

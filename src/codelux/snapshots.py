@@ -4,10 +4,11 @@ import hashlib
 import json
 import os
 import uuid
+from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import replace
-from typing import Mapping, Optional, Tuple
+from typing import Optional, Tuple
 
 from codelux.errors import ValidationError
 from codelux.models import (

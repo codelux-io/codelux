@@ -7,7 +7,6 @@ from typing import Callable, Optional
 
 from codelux.errors import UnsafePathError
 
-
 FileValidator = Callable[[Path], None]
 
 

@@ -3,10 +3,11 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 import codelux.cli as cli_module
-import codelux.sync_transport as sync_transport
+from codelux import sync_transport
 from codelux.adapters.claude import ClaudeAdapter
 from codelux.adapters.codex import CodexAdapter
 from codelux.cli import main
@@ -39,6 +40,16 @@ def test_codex_project_mapping_prompts_for_each_source_project(tmp_path: Path, m
     monkeypatch.setattr(cli_module.click, "prompt", lambda *args, **kwargs: next(answers))
     mappings = cli_module._codex_project_mapping({"codex/state_5.sqlite": database.read_bytes()})
     assert mappings == {"/source/one": Path("/target/one")}
+
+
+def test_project_directory_requires_real_absolute_path(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="real absolute path"):
+        cli_module._project_directory("-Users-user-project", local=False)
+    with pytest.raises(ValidationError, match="does not exist"):
+        cli_module._project_directory(tmp_path / "missing", local=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    assert cli_module._project_directory(project, local=True) == project
 
 
 def _claude_home(tmp_path: Path) -> Path:
@@ -539,6 +550,35 @@ def test_sync_import_config_gate_confirmation_and_success(tmp_path: Path, monkey
     assert (target / ".claude/settings.json").read_text() == '{"source":true}\n'
 
 
+def test_sync_import_maps_claude_history_from_real_paths(tmp_path: Path, monkeypatch) -> None:
+    source = _claude_home(tmp_path / "source")
+    source_project_path = "/source/project"
+    source_project = source / ".claude/projects/-source-project"
+    source_project.mkdir(parents=True)
+    (source_project / "session.jsonl").write_text(json.dumps({"cwd": source_project_path}) + "\n")
+    manifest, paths = build_manifest(source, ["sessions"], clients=("claude",))
+    manifest, payload = cli_module.materialize_sync_files(manifest, paths)
+    target = _claude_home(tmp_path / "target")
+    (target / ".codelux").mkdir()
+    target_project = target / "work/project"
+    target_project.mkdir(parents=True)
+    archive = tmp_path / "sessions.cdlx"
+    archive.write_bytes(b"test archive")
+    monkeypatch.setattr(cli_module, "import_encrypted", lambda *args: (manifest, payload))
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+
+    result = CliRunner().invoke(
+        main,
+        ["sync", "import", str(archive), "--password-stdin", "--overwrite"],
+        input=f"test password\n{target_project}\n",
+        env={"CODELUX_TEST_HOME": str(target)},
+    )
+
+    assert result.exit_code == 0, result.output
+    mapped = target / ".claude/projects" / _claude_project_slug(target_project) / "session.jsonl"
+    assert json.loads(mapped.read_text())["cwd"] == str(target_project)
+
+
 def test_sync_push_provider_success_and_registry_compensation(tmp_path: Path, monkeypatch) -> None:
     home = _claude_home(tmp_path)
     settings = home / ".claude/settings.json"
@@ -636,6 +676,83 @@ def test_sync_push_without_selection_can_cancel_all_content(tmp_path: Path, monk
     assert result.exit_code == 0, result.output
     assert "No content selected; synchronization cancelled." in result.output
     assert "Checking source Codelux state" not in result.output
+
+
+def test_sync_process_preflight_ignores_unselected_running_client(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = _claude_home(tmp_path)
+    (home / ".codex").mkdir()
+    root = home / ".codelux"
+    root.mkdir()
+    (root / "providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    monkeypatch.setenv("CODELUX_TEST_HOME", str(home))
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_running", lambda self: ProcessState.RUNNING)
+
+    cli_module._sync_process_preflight(("sessions",), ("claude",))
+    with pytest.raises(ValidationError, match="codex"):
+        cli_module._sync_process_preflight(("sessions",))
+
+
+def test_sync_push_passes_selected_client_to_process_preflight(tmp_path: Path, monkeypatch) -> None:
+    home = _claude_home(tmp_path)
+    (home / ".codex").mkdir()
+    root = home / ".codelux"
+    root.mkdir()
+    (root / "providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_running", lambda self: ProcessState.RUNNING)
+    monkeypatch.setattr(
+        cli_module,
+        "push_archive",
+        lambda *args, **kwargs: (local_capability(home), {"status": "committed"}),
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["sync", "push", "--ssh", "root@example.com", "--claude-sessions"],
+        input="\n",
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert '"status": "committed"' in result.output
+
+
+def test_sync_transport_send_passes_selected_client_to_process_preflight(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = _claude_home(tmp_path)
+    (home / ".codex").mkdir()
+    root = home / ".codelux"
+    root.mkdir()
+    (root / "providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_running", lambda self: ProcessState.RUNNING)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "sync",
+            "transport",
+            "send",
+            "--protocol",
+            "1",
+            "--sessions",
+            "--claude-sessions",
+            "--keys",
+        ],
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+
+    assert result.exit_code == 0, result.output
 
 
 def test_sync_push_interactive_sessions_has_no_config_replacement(
@@ -840,6 +957,7 @@ def test_sync_pull_maps_claude_history_to_local_project(tmp_path: Path, monkeypa
         lambda *args, **kwargs: (local_capability(source), manifest, payload),
     )
     local_project = target / "workspace/litellm"
+    local_project.mkdir(parents=True)
     result = CliRunner().invoke(
         main,
         ["sync", "pull", "--ssh", "root@example.com", "--claude-sessions", "--overwrite"],
@@ -873,6 +991,61 @@ def test_sync_transport_receive_records_push_operation(tmp_path: Path) -> None:
     store = SnapshotStore(target / ".codelux")
     operation_id = next(path.name for path in store.backups.iterdir() if path.is_dir())
     assert store.read_manifest(operation_id).operation_type == "sync_push"
+
+
+def test_sync_transport_receive_checks_selected_target_process(tmp_path: Path, monkeypatch) -> None:
+    source = _claude_home(tmp_path / "source")
+    project = source / ".claude/projects/source"
+    project.mkdir(parents=True)
+    (project / "session.jsonl").write_text('{"cwd":"/source/project"}\n')
+    target = _claude_home(tmp_path / "target")
+    (target / ".codelux").mkdir()
+    (target / ".codelux/providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    manifest, files = build_manifest(source, ["sessions"], clients=("claude",))
+    archive = create_plain_archive(manifest, files)
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.RUNNING)
+
+    result = CliRunner().invoke(
+        main,
+        ["sync", "transport", "receive", "--protocol", "1"],
+        input=archive,
+        env={"CODELUX_TEST_HOME": str(target)},
+    )
+
+    assert result.exit_code != 0
+    assert "sync clients are running or process state is unknown: claude" in result.output
+    assert not (target / ".claude/projects/source/session.jsonl").exists()
+
+
+def test_sync_transport_receive_requires_existing_real_target_project(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _claude_home(tmp_path / "source")
+    project = source / ".claude/projects/source"
+    project.mkdir(parents=True)
+    missing_project = tmp_path / "missing-project"
+    (project / "session.jsonl").write_text(json.dumps({"cwd": str(missing_project)}) + "\n")
+    target = _claude_home(tmp_path / "target")
+    (target / ".codelux").mkdir()
+    (target / ".codelux/providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    manifest, files = build_manifest(source, ["sessions"], clients=("claude",))
+    archive = create_plain_archive(manifest, files)
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+
+    result = CliRunner().invoke(
+        main,
+        ["sync", "transport", "receive", "--protocol", "1"],
+        input=archive,
+        env={"CODELUX_TEST_HOME": str(target)},
+    )
+
+    assert result.exit_code != 0
+    assert "local project directory does not exist" in result.output
+    assert not (target / ".claude/projects/source/session.jsonl").exists()
 
 
 def test_sync_pull_rejects_removed_config_option(tmp_path: Path) -> None:

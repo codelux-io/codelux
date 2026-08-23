@@ -10,17 +10,16 @@ import tarfile
 import tempfile
 import time
 import uuid
-from dataclasses import replace
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Mapping, Optional, Sequence, Union
+from typing import Any, Optional, Union
 
 from codelux.errors import CodeluxError, ValidationError
 from codelux.models import FileState, Manifest, ManifestFile, OperationState
 from codelux.safe_files import atomic_write_private, ensure_private_dir
 from codelux.snapshots import SnapshotStore, _logical_target
-
 
 MAGIC = b"CDLXSYNC"
 VERSION = 1
@@ -973,9 +972,7 @@ def _merge_provider_registry(target: Path, incoming: bytes, overwrite: bool) -> 
         existing_clients = existing["clients"]
         for client, binding in incoming_clients.items():
             old_binding = existing_clients.get(client)
-            if old_binding is None or old_binding == binding:
-                existing_clients[client] = binding
-            elif overwrite:
+            if old_binding is None or old_binding == binding or overwrite:
                 existing_clients[client] = binding
             else:
                 raise ValidationError(

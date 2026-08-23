@@ -1,7 +1,7 @@
 import importlib.util
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 try:
     import tomllib
@@ -11,7 +11,6 @@ except ModuleNotFoundError:  # pragma: no cover - exercised by the Python 3.9/3.
 import pytest
 
 from codelux import __version__
-
 
 ROOT = Path(__file__).parents[1]
 SCRIPT_PATH = ROOT / "scripts/release_artifacts.py"

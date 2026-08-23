@@ -5,16 +5,16 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
-from typing import Mapping, Optional, Tuple
+from typing import Optional, Tuple
 
 from codelux.adapters.base import ClientAdapter, config_file
 from codelux.errors import ValidationError
 from codelux.models import ConfigFile, ConfigState, ObservedConfig, PreparedChange, ProcessState
 from codelux.registry import Registry
 from codelux.safe_files import atomic_write_private
-
 
 OFFICIAL_BASE_URLS = {"https://api.anthropic.com"}
 
