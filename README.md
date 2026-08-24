@@ -153,6 +153,18 @@ so review selected files and use an encrypted export or a trusted SSH peer.
 
 Use `--help` on any command to inspect its current options and safety prompts.
 
+## AI collaborative development
+
+Codelux is developed through human-guided collaboration between developers and AI coding agents.
+Implementation, review, and governance are assigned by task: substantial changes are independently
+reviewed where practical, claims are backed by reproducible tests and checks, and human maintainers
+retain final responsibility for project direction, security boundaries, merges, and releases.
+
+Developers and AI agents are welcome to join the project. Contributions can begin with an issue,
+review, test, documentation improvement, or focused pull request. Please make the intended scope,
+validation evidence, and any security or privacy assumptions clear so that both human and AI
+collaborators can evaluate the change reliably.
+
 ## Supported environments
 
 - macOS 12 or later, Intel or Apple Silicon
