@@ -28,6 +28,7 @@ Codelux is not a replacement for every cc-switch feature. Choose cc-switch for a
 - Fail-closed handling for unknown or incomplete local state
 - Encrypted offline archives and OpenSSH-based synchronization
 - Explicit conflict handling for synchronized configuration and session data
+- Selective synchronization of Claude Code and Codex project/user environments and project memory
 
 ## Security model
 
@@ -127,6 +128,28 @@ project and paste its output. Do not enter Claude Code's internal storage key, s
 `-Users-user-work-project`; Codelux generates that key automatically. Local pull targets and remote
 push targets must already exist and be directories. A client that is not selected for session
 synchronization does not need to be stopped.
+
+Synchronize a project's portable agent environment together with local overrides, user-level
+agent configuration, and Claude project memory:
+
+```bash
+codelux sync push --ssh user@host.example \
+  --project-env --local-project-env --user-env --memory \
+  --project-map /work/my-project=/srv/my-project
+```
+
+The shared project allowlist includes hierarchical `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`,
+project-contained Claude imports, `.mcp.json`, selected Claude settings/rules/skills/agents/commands,
+and selected Codex configuration/rules/hooks. Local-only files such as `CLAUDE.local.md` and
+`.claude/settings.local.json` require `--local-project-env`. With multiple projects, repeat
+`--project-map SOURCE=TARGET`; mappings are explicit and never depend on option order. Offline
+imports expose only opaque project IDs and use `--target-project PROJECT_ID=TARGET`.
+
+Authentication databases, OAuth/account state, Provider routing, Codex trust, and user-level Codex
+MCP server tables are excluded. Secret-shaped JSON fields are removed, and an MCP command argument
+array is cleared in full when it contains a credential flag or recognized token prefix; reconfigure
+that command on the target. Free-form instructions and commands can still contain private material,
+so review selected files and use an encrypted export or a trusted SSH peer.
 
 Use `--help` on any command to inspect its current options and safety prompts.
 

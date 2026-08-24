@@ -5,7 +5,7 @@ import os
 import sys
 from functools import wraps
 from pathlib import Path
-from typing import Callable, Optional, TypedDict, TypeVar
+from typing import Any, Callable, Optional, TypedDict, TypeVar
 
 import click
 
@@ -33,6 +33,7 @@ from codelux.registry_io import load_registry, save_registry
 from codelux.safe_files import atomic_write_private
 from codelux.snapshots import SnapshotStore
 from codelux.sync import (
+    _project_id,
     apply_import,
     build_manifest,
     codex_session_projects,
@@ -55,6 +56,7 @@ from codelux.sync_transport import (
     parse_plain_archive,
     pull_archive,
     push_archive,
+    read_path_payload,
     validate_capability,
 )
 
@@ -88,15 +90,110 @@ def sync_group() -> None:
     """Synchronize selected state between isolated Codelux homes."""
 
 
-def _sync_selection(config: bool, sessions: bool, providers: bool) -> tuple[str, ...]:
+def _sync_selection(
+    config: bool,
+    sessions: bool,
+    providers: bool,
+    project_env: bool = False,
+    local_env: bool = False,
+    user_env: bool = False,
+    memory: bool = False,
+) -> tuple[str, ...]:
     selected = tuple(
         name
-        for name, enabled in (("config", config), ("sessions", sessions), ("providers", providers))
+        for name, enabled in (
+            ("config", config),
+            ("sessions", sessions),
+            ("providers", providers),
+            ("project_env", project_env),
+            ("local_env", local_env),
+            ("user_env", user_env),
+            ("memory", memory),
+        )
         if enabled
     )
     if not selected:
-        raise ValidationError("select at least one of --config, --sessions, or --providers")
+        raise ValidationError("select at least one supported synchronization scope")
+    if local_env and not project_env:
+        raise ValidationError("--local-project-env requires --project-env")
     return selected
+
+
+def _environment_project_roots(
+    values: tuple[Path, ...], *, local: bool, prompt: str, default_cwd: bool = False
+) -> tuple[Path, ...]:
+    if values:
+        return tuple(_project_directory(value, local=local) for value in values)
+    default = str(Path.cwd()) if default_cwd else ""
+    value = click.prompt(prompt, default=default, show_default=default_cwd)
+    return (_project_directory(value, local=local),)
+
+
+def _environment_target_mapping(
+    manifest: object, source_roots: tuple[Path, ...], target_roots: tuple[Path, ...]
+) -> dict[str, Path]:
+    project_ids = tuple(_project_id(path) for path in source_roots)
+    if set(getattr(manifest, "project_ids", ())) != set(project_ids):
+        raise ValidationError("project environment source mapping does not match the archive")
+    if len(source_roots) != len(target_roots):
+        raise ValidationError("each source project requires one target project directory")
+    return dict(zip(project_ids, target_roots))
+
+
+def _explicit_project_mappings(
+    values: tuple[str, ...], *, source_local: bool, target_local: bool
+) -> tuple[tuple[Path, ...], dict[str, Path]]:
+    sources = []
+    mapping: dict[str, Path] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValidationError("--project-map must use SOURCE=TARGET")
+        source_text, target_text = value.split("=", 1)
+        source = _project_directory(source_text, local=source_local)
+        target = _project_directory(target_text, local=target_local)
+        project_id = _project_id(source)
+        if project_id in mapping or target in mapping.values():
+            raise ValidationError("project mappings must use distinct sources and targets")
+        sources.append(source)
+        mapping[project_id] = target
+    return tuple(sources), mapping
+
+
+def _target_mapping_by_id(project_ids: tuple[str, ...], values: tuple[str, ...]) -> dict[str, Path]:
+    mapping: dict[str, Path] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValidationError("--target-project must use PROJECT_ID=TARGET")
+        project_id, target_text = value.split("=", 1)
+        if project_id not in project_ids or project_id in mapping:
+            raise ValidationError(
+                "target project mapping contains an unknown or duplicate project ID"
+            )
+        target = _project_directory(target_text, local=True)
+        if target in mapping.values():
+            raise ValidationError("project mappings must use distinct targets")
+        mapping[project_id] = target
+    if set(mapping) != set(project_ids):
+        raise ValidationError("each project ID requires one target project directory")
+    return mapping
+
+
+def _environment_targets_for_sources(
+    source_roots: tuple[Path, ...], values: tuple[Path, ...], *, local: bool
+) -> tuple[Path, ...]:
+    if values:
+        targets = tuple(_project_directory(value, local=local) for value in values)
+    else:
+        targets = tuple(
+            _project_directory(
+                click.prompt(f"Target project directory for agent environment {source}"),
+                local=local,
+            )
+            for source in source_roots
+        )
+    if len(targets) != len(source_roots):
+        raise ValidationError("each source project requires one target project directory")
+    return targets
 
 
 def _sync_password(password_stdin: bool) -> str:
@@ -133,6 +230,11 @@ def _sync_locked(command: F) -> F:
 @click.option("--config", "include_config", is_flag=True)
 @click.option("--sessions", "include_sessions", is_flag=True)
 @click.option("--providers", "include_providers", is_flag=True)
+@click.option("--project-env", is_flag=True, help="Synchronize shared project agent files.")
+@click.option("--local-project-env", is_flag=True, help="Include local project overrides.")
+@click.option("--user-env", is_flag=True, help="Synchronize user-level agent configuration.")
+@click.option("--memory", "include_memory", is_flag=True, help="Synchronize project memory.")
+@click.option("--project-root", multiple=True, type=click.Path(path_type=Path))
 @click.option(
     "--keys/--no-keys",
     default=True,
@@ -150,15 +252,35 @@ def sync_export(
     include_config: bool,
     include_sessions: bool,
     include_providers: bool,
+    project_env: bool,
+    local_project_env: bool,
+    user_env: bool,
+    include_memory: bool,
+    project_root: tuple[Path, ...],
     keys: bool,
     confirm_keys: bool,
     password_stdin: bool,
 ) -> None:
     """Create an authenticated encrypted offline sync archive."""
     try:
-        selected = _sync_selection(include_config, include_sessions, include_providers)
+        selected = _sync_selection(
+            include_config,
+            include_sessions,
+            include_providers,
+            project_env,
+            local_project_env,
+            user_env,
+            include_memory,
+        )
+        roots = (
+            _environment_project_roots(
+                project_root, local=True, prompt="Source project directory", default_cwd=True
+            )
+            if set(selected).intersection({"project_env", "local_env", "memory"})
+            else ()
+        )
         _sync_process_preflight(selected)
-        manifest, files = build_manifest(_home(), selected, keys)
+        manifest, files = build_manifest(_home(), selected, keys, project_roots=roots)
         export_encrypted(manifest, files, _sync_password(password_stdin), output)
         click.echo(f"exported {manifest.transfer_id}")
     except CodeluxError as exc:
@@ -171,13 +293,19 @@ def _push_selection(
     claude_sessions: bool = False,
     codex_sessions: bool = False,
     overwrite: bool = False,
+    project_env: bool = False,
+    local_env: bool = False,
+    user_env: bool = False,
+    memory: bool = False,
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     requested_clients = []
     if sessions or claude_sessions:
         requested_clients.append("claude")
     if sessions or codex_sessions:
         requested_clients.append("codex")
-    explicit = providers or bool(requested_clients)
+    if local_env and not project_env:
+        raise ValidationError("--local-project-env requires --project-env")
+    explicit = providers or bool(requested_clients) or project_env or user_env or memory
     prompted = []
     if not explicit:
         if _safe_confirm("Synchronize third-party Providers and API keys?", default=True):
@@ -186,10 +314,23 @@ def _push_selection(
             requested_clients.append("claude")
         if _safe_confirm("Synchronize Codex session history?", default=False):
             requested_clients.append("codex")
+        project_env = _safe_confirm("Synchronize shared project agent environment?", default=False)
+        if project_env:
+            local_env = _safe_confirm("Include local project overrides?", default=False)
+        user_env = _safe_confirm("Synchronize user-level agent environment?", default=False)
+        memory = _safe_confirm("Synchronize project memory?", default=False)
     if providers:
         prompted.append("providers")
     if requested_clients:
         prompted.append("sessions")
+    if project_env:
+        prompted.append("project_env")
+    if local_env:
+        prompted.append("local_env")
+    if user_env:
+        prompted.append("user_env")
+    if memory:
+        prompted.append("memory")
     return tuple(prompted), tuple(sorted(set(requested_clients))), ()
 
 
@@ -220,10 +361,8 @@ def _project_directory(value: object, *, local: bool) -> Path:
             "on the target machine and paste its output"
         )
     path = Path(os.path.abspath(path))
-    if local and not path.is_dir():
-        raise ValidationError(
-            f"local project directory does not exist or is not a directory: {path}"
-        )
+    if local and (not path.is_dir() or path.is_symlink()):
+        raise ValidationError(f"local project directory does not exist or is unsafe: {path}")
     return path
 
 
@@ -302,6 +441,12 @@ def _codex_project_mapping(files: dict[str, bytes], *, local: bool = False) -> d
 @click.argument("archive", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--password-stdin", is_flag=True)
 @click.option("--overwrite", is_flag=True)
+@click.option("--target-project-root", multiple=True, type=click.Path(path_type=Path))
+@click.option(
+    "--target-project",
+    multiple=True,
+    help="Explicit environment mapping as PROJECT_ID=TARGET; required for multiple projects.",
+)
 @click.option(
     "--claude-project-root",
     type=click.Path(path_type=Path),
@@ -321,6 +466,8 @@ def sync_import(
     archive: Path,
     password_stdin: bool,
     overwrite: bool,
+    target_project_root: tuple[Path, ...],
+    target_project: tuple[str, ...],
     claude_project_root: Optional[Path],
     claude_source_project: Optional[str],
     apply_active_provider: bool,
@@ -328,6 +475,30 @@ def sync_import(
     """Apply an encrypted archive to this isolated HOME."""
     try:
         manifest, files = import_encrypted(archive, _sync_password(password_stdin))
+        environment_mapping: dict[str, Path] = {}
+        if manifest.project_ids:
+            if target_project and target_project_root:
+                raise ValidationError("use either --target-project or --target-project-root")
+            if target_project:
+                environment_mapping = _target_mapping_by_id(manifest.project_ids, target_project)
+            elif target_project_root:
+                if len(manifest.project_ids) != 1 or len(target_project_root) != 1:
+                    raise ValidationError(
+                        "multiple projects require --target-project PROJECT_ID=TARGET"
+                    )
+                environment_mapping = {
+                    manifest.project_ids[0]: _project_directory(target_project_root[0], local=True)
+                }
+            else:
+                environment_mapping = {
+                    project_id: _project_directory(
+                        click.prompt(
+                            f"Target project directory for agent environment {project_id}"
+                        ),
+                        local=True,
+                    )
+                    for project_id in manifest.project_ids
+                }
         if "config" in manifest.selection and not apply_active_provider:
             raise ValidationError("archive config requires --apply-active-provider")
         if apply_active_provider and "config" not in manifest.selection:
@@ -390,6 +561,7 @@ def sync_import(
             overwrite,
             None,
             codex_project_roots=codex_roots,
+            environment_project_roots=environment_mapping,
         )
         payload = {"transfer_id": manifest.transfer_id, "files": sorted(files), "missing": missing}
         click.echo(json.dumps(payload, indent=2))
@@ -403,6 +575,17 @@ def sync_import(
 @click.option("--claude-sessions", is_flag=True, help="Synchronize Claude Code project history.")
 @click.option("--codex-sessions", is_flag=True, help="Synchronize Codex session history.")
 @click.option("--providers", "include_providers", is_flag=True)
+@click.option("--project-env", is_flag=True, help="Synchronize shared project agent files.")
+@click.option("--local-project-env", is_flag=True, help="Include local project overrides.")
+@click.option("--user-env", is_flag=True, help="Synchronize user-level agent configuration.")
+@click.option("--memory", "include_memory", is_flag=True, help="Synchronize project memory.")
+@click.option("--project-root", multiple=True, type=click.Path(path_type=Path))
+@click.option("--target-project-root", multiple=True, type=click.Path(path_type=Path))
+@click.option(
+    "--project-map",
+    multiple=True,
+    help="Explicit environment mapping as SOURCE=TARGET; required for multiple projects.",
+)
 @click.option(
     "--keys/--no-keys",
     default=True,
@@ -430,6 +613,13 @@ def sync_push(
     claude_sessions: bool,
     codex_sessions: bool,
     include_providers: bool,
+    project_env: bool,
+    local_project_env: bool,
+    user_env: bool,
+    include_memory: bool,
+    project_root: tuple[Path, ...],
+    target_project_root: tuple[Path, ...],
+    project_map: tuple[str, ...],
     keys: bool,
     overwrite: bool,
     claude_project_root: Optional[Path],
@@ -440,7 +630,15 @@ def sync_push(
     del no_incremental
     try:
         selected, session_clients, overwrite_clients = _push_selection(
-            include_sessions, include_providers, claude_sessions, codex_sessions, overwrite
+            include_sessions,
+            include_providers,
+            claude_sessions,
+            codex_sessions,
+            overwrite,
+            project_env,
+            local_project_env,
+            user_env,
+            include_memory,
         )
         if not selected:
             click.echo("No content selected; synchronization cancelled.")
@@ -452,9 +650,42 @@ def sync_push(
         target = ssh_target or str(click.prompt("SSH target (user@host)"))
         if claude_project_root is not None:
             claude_project_root = _project_directory(claude_project_root, local=False)
+        environment_mapping: dict[str, Path] = {}
+        environment_selected = bool(
+            set(selected).intersection({"project_env", "local_env", "memory"})
+        )
+        if project_map and (project_root or target_project_root):
+            raise ValidationError("use --project-map instead of separate project-root options")
+        if environment_selected and project_map:
+            environment_source_roots, environment_mapping = _explicit_project_mappings(
+                project_map, source_local=True, target_local=False
+            )
+        elif environment_selected:
+            environment_source_roots = _environment_project_roots(
+                project_root, local=True, prompt="Source project directory", default_cwd=True
+            )
+            if len(environment_source_roots) > 1 or len(target_project_root) > 1:
+                raise ValidationError("multiple projects require --project-map SOURCE=TARGET")
+        else:
+            environment_source_roots = ()
         click.echo("[2/6] Collecting source files...")
-        manifest, files = build_manifest(_home(), selected, keys, clients=session_clients)
+        manifest, files = build_manifest(
+            _home(),
+            selected,
+            keys,
+            clients=session_clients,
+            project_roots=environment_source_roots,
+        )
         manifest, payload = materialize_sync_files(manifest, files)
+        if environment_source_roots and not environment_mapping:
+            environment_targets = _environment_targets_for_sources(
+                environment_source_roots, target_project_root, local=False
+            )
+            environment_mapping = _environment_target_mapping(
+                manifest, environment_source_roots, environment_targets
+            )
+        elif environment_mapping and set(environment_mapping) != set(manifest.project_ids):
+            raise ValidationError("project environment source mapping does not match the archive")
         if "sessions" in selected:
             project_roots: dict[str, Path] = {}
             codex_roots: dict[str, Path] = {}
@@ -525,6 +756,9 @@ def sync_push(
         )
         archive = create_plain_archive(manifest, tuple(payload.items()))
         click.echo("[4/6] Connecting to the target and checking capabilities...")
+        transport_kwargs: dict[str, Any] = {}
+        if environment_mapping:
+            transport_kwargs["environment_project_roots"] = environment_mapping
         if overwrite_clients:
             capability, response = push_archive(
                 target,
@@ -533,6 +767,7 @@ def sync_push(
                 overwrite,
                 progress=lambda message: click.echo(f"[4/6] {message}"),
                 overwrite_clients=overwrite_clients,
+                **transport_kwargs,
             )
         else:
             capability, response = push_archive(
@@ -541,6 +776,7 @@ def sync_push(
                 archive,
                 overwrite,
                 progress=lambda message: click.echo(f"[4/6] {message}"),
+                **transport_kwargs,
             )
         click.echo(
             f"[5/6] Target accepted protocol 1 ({capability.codelux_version}); transaction committed."
@@ -561,6 +797,17 @@ def sync_push(
 @click.option("--claude-sessions", is_flag=True, help="Synchronize Claude Code project history.")
 @click.option("--codex-sessions", is_flag=True, help="Synchronize Codex session history.")
 @click.option("--providers", "include_providers", is_flag=True)
+@click.option("--project-env", is_flag=True, help="Synchronize shared project agent files.")
+@click.option("--local-project-env", is_flag=True, help="Include local project overrides.")
+@click.option("--user-env", is_flag=True, help="Synchronize user-level agent configuration.")
+@click.option("--memory", "include_memory", is_flag=True, help="Synchronize project memory.")
+@click.option("--project-root", multiple=True, type=click.Path(path_type=Path))
+@click.option("--target-project-root", multiple=True, type=click.Path(path_type=Path))
+@click.option(
+    "--project-map",
+    multiple=True,
+    help="Explicit environment mapping as SOURCE=TARGET; required for multiple projects.",
+)
 @click.option(
     "--keys/--no-keys",
     default=True,
@@ -584,6 +831,13 @@ def sync_pull(
     claude_sessions: bool,
     codex_sessions: bool,
     include_providers: bool,
+    project_env: bool,
+    local_project_env: bool,
+    user_env: bool,
+    include_memory: bool,
+    project_root: tuple[Path, ...],
+    target_project_root: tuple[Path, ...],
+    project_map: tuple[str, ...],
     keys: bool,
     overwrite: bool,
     claude_project_root: Optional[Path],
@@ -593,7 +847,15 @@ def sync_pull(
     del no_incremental
     try:
         selected, session_clients, overwrite_clients = _push_selection(
-            include_sessions, include_providers, claude_sessions, codex_sessions, overwrite
+            include_sessions,
+            include_providers,
+            claude_sessions,
+            codex_sessions,
+            overwrite,
+            project_env,
+            local_project_env,
+            user_env,
+            include_memory,
         )
         if not selected:
             click.echo("No content selected; synchronization cancelled.")
@@ -601,6 +863,24 @@ def sync_pull(
         overwrite_clients = _session_overwrite_prompts(session_clients, overwrite)
         _sync_process_preflight(selected, session_clients)
         target = ssh_target or str(click.prompt("SSH source (user@host)"))
+        environment_mapping: dict[str, Path] = {}
+        environment_selected = bool(
+            set(selected).intersection({"project_env", "local_env", "memory"})
+        )
+        if project_map and (project_root or target_project_root):
+            raise ValidationError("use --project-map instead of separate project-root options")
+        if environment_selected and project_map:
+            requested_environment_roots, environment_mapping = _explicit_project_mappings(
+                project_map, source_local=False, target_local=True
+            )
+        elif environment_selected:
+            requested_environment_roots = _environment_project_roots(
+                project_root, local=False, prompt="Source project directory on remote machine"
+            )
+            if len(requested_environment_roots) > 1 or len(target_project_root) > 1:
+                raise ValidationError("multiple projects require --project-map SOURCE=TARGET")
+        else:
+            requested_environment_roots = ()
         click.echo("[1/4] Checking local Codelux state...")
         capability, manifest, files = pull_archive(
             target,
@@ -609,7 +889,17 @@ def sync_pull(
             keys,
             progress=lambda message: click.echo(f"[2/4] {message}"),
             clients=session_clients,
+            project_roots=requested_environment_roots,
         )
+        if manifest.project_ids and not environment_mapping:
+            environment_targets = _environment_targets_for_sources(
+                requested_environment_roots, target_project_root, local=True
+            )
+            environment_mapping = _environment_target_mapping(
+                manifest, requested_environment_roots, environment_targets
+            )
+        elif environment_mapping and set(environment_mapping) != set(manifest.project_ids):
+            raise ValidationError("project environment source mapping does not match the archive")
         if "claude" in session_clients:
             source_slugs = sorted(
                 {
@@ -658,6 +948,7 @@ def sync_pull(
             else {"claude": "claude" in overwrite_clients, "codex": "codex" in overwrite_clients},
             None,
             codex_project_roots=codex_roots,
+            environment_project_roots=environment_mapping,
             operation_type="sync_pull",
         )
         click.echo("[4/4] Local transaction committed.")
@@ -768,8 +1059,12 @@ def _standardize_sync_source(
 def _sync_process_preflight(
     selection: tuple[str, ...], clients: Optional[tuple[str, ...]] = None
 ) -> None:
-    if not set(selection).intersection({"config", "sessions"}):
+    if not set(selection).intersection(
+        {"config", "sessions", "project_env", "local_env", "user_env", "memory"}
+    ):
         return
+    if set(selection).intersection({"project_env", "local_env", "user_env", "memory"}):
+        clients = None
     adapters, _, _ = _adapters()
     home = _home()
     installed = {
@@ -796,7 +1091,13 @@ def _machine_id_for_home(home: Path) -> Optional[str]:
 
 @sync_group.command(name="reset")
 @click.option("--machine", "remote_machine", required=True)
-@click.option("--selection", multiple=True, type=click.Choice(["config", "sessions", "providers"]))
+@click.option(
+    "--selection",
+    multiple=True,
+    type=click.Choice(
+        ["config", "sessions", "providers", "project_env", "local_env", "user_env", "memory"]
+    ),
+)
 @_sync_locked
 def sync_reset(remote_machine: str, selection: tuple[str, ...]) -> None:
     """Forget sync baselines for a remote machine."""
@@ -829,6 +1130,7 @@ def sync_transport_group() -> None:
 @click.option("--overwrite-claude", is_flag=True)
 @click.option("--overwrite-codex", is_flag=True)
 @click.option("--claude-project-root", type=click.Path(path_type=Path))
+@click.option("--project-map-stdin", is_flag=True)
 @_sync_locked
 def sync_transport_receive(
     protocol: int,
@@ -836,6 +1138,7 @@ def sync_transport_receive(
     overwrite_claude: bool,
     overwrite_codex: bool,
     claude_project_root: Optional[Path],
+    project_map_stdin: bool,
 ) -> None:
     """Receive one validated plaintext archive over the authenticated SSH stream."""
     try:
@@ -843,7 +1146,17 @@ def sync_transport_receive(
             raise ValidationError("unsupported sync protocol")
         capability = local_capability(_home())
         click.echo(json.dumps(capability.to_dict(), sort_keys=True), nl=True)
-        raw = sys.stdin.buffer.read()
+        input_stream = sys.stdin.buffer
+        environment_mapping = {}
+        if project_map_stdin:
+            decoded = read_path_payload(input_stream)
+            if not isinstance(decoded, dict):
+                raise ValidationError("project path payload is invalid")
+            environment_mapping = {
+                str(project_id): _project_directory(target, local=True)
+                for project_id, target in decoded.items()
+            }
+        raw = input_stream.read()
         manifest, files = parse_plain_archive(raw)
         validate_capability(capability, manifest)
         _sync_process_preflight(manifest.selection, _manifest_clients(manifest))
@@ -860,6 +1173,7 @@ def sync_transport_receive(
             files,
             overwrite_policy,
             claude_project_root,
+            environment_project_roots=environment_mapping,
             operation_type="sync_push",
         )
         click.echo(
@@ -876,6 +1190,11 @@ def sync_transport_receive(
 @click.option("--config", "include_config", is_flag=True)
 @click.option("--sessions", "include_sessions", is_flag=True)
 @click.option("--providers", "include_providers", is_flag=True)
+@click.option("--project-env", is_flag=True)
+@click.option("--local-project-env", is_flag=True)
+@click.option("--user-env", is_flag=True)
+@click.option("--memory", "include_memory", is_flag=True)
+@click.option("--project-roots-stdin", is_flag=True)
 @click.option("--claude-sessions", is_flag=True)
 @click.option("--codex-sessions", is_flag=True)
 @click.option("--keys/--no-keys", default=True)
@@ -885,6 +1204,11 @@ def sync_transport_send(
     include_config: bool,
     include_sessions: bool,
     include_providers: bool,
+    project_env: bool,
+    local_project_env: bool,
+    user_env: bool,
+    include_memory: bool,
+    project_roots_stdin: bool,
     claude_sessions: bool,
     codex_sessions: bool,
     keys: bool,
@@ -893,7 +1217,21 @@ def sync_transport_send(
     try:
         if protocol != 1:
             raise ValidationError("unsupported sync protocol")
-        selected = _sync_selection(include_config, include_sessions, include_providers)
+        selected = _sync_selection(
+            include_config,
+            include_sessions,
+            include_providers,
+            project_env,
+            local_project_env,
+            user_env,
+            include_memory,
+        )
+        project_roots: tuple[Path, ...] = ()
+        if project_roots_stdin:
+            decoded = read_path_payload(sys.stdin.buffer)
+            if not isinstance(decoded, list) or any(not isinstance(item, str) for item in decoded):
+                raise ValidationError("project path payload is invalid")
+            project_roots = tuple(_project_directory(item, local=True) for item in decoded)
         clients = tuple(
             client
             for client, enabled in (("claude", claude_sessions), ("codex", codex_sessions))
@@ -903,8 +1241,15 @@ def sync_transport_send(
             clients = ("claude", "codex")
         _sync_process_preflight(selected, clients)
         _ensure_sync_source_healthy(selected, clients)
-        manifest, files = build_manifest(_home(), selected, keys, clients=clients or None)
-        archive = create_plain_archive(manifest, files)
+        manifest, files = build_manifest(
+            _home(),
+            selected,
+            keys,
+            clients=clients or None,
+            project_roots=project_roots,
+        )
+        manifest, payload = materialize_sync_files(manifest, files)
+        archive = create_plain_archive(manifest, tuple(payload.items()))
         output = sys.stdout.buffer
         output.write(canonical_line(local_capability(_home()).to_dict()))
         output.write(archive)

@@ -28,6 +28,7 @@ Codelux 并不试图覆盖 cc-switch 的全部功能：需要广泛图形化管�
 - 对未知或不完整本地状态执行失败关闭
 - 加密离线归档和基于 OpenSSH 的同步
 - 对同步配置和会话数据执行明确的冲突处理
+- 按需同步 Claude Code 和 Codex 的项目/用户环境及项目记忆
 
 ## 安全模型
 
@@ -125,6 +126,26 @@ codelux sync pull --ssh user@host.example --providers
 Linux 上，最可靠的方式是在目标项目中运行 `pwd` 并粘贴输出。不要输入
 `-Users-user-work-project` 这类 Claude Code 内部存储键；Codelux 会自动生成该键。本地 pull
 目标和远端 push 目标都必须已经存在且是目录。未选择同步会话的客户端不需要停止。
+
+同步项目的可移植 Agent 环境、本地覆盖、用户级 Agent 配置和 Claude 项目记忆：
+
+```bash
+codelux sync push --ssh user@host.example \
+  --project-env --local-project-env --user-env --memory \
+  --project-map /work/my-project=/srv/my-project
+```
+
+共享项目白名单包括分层 `AGENTS.md`、`AGENTS.override.md`、`CLAUDE.md`、项目内 Claude
+导入文件、`.mcp.json`、选定的 Claude settings/rules/skills/agents/commands，以及选定的
+Codex 配置/rules/hooks。`CLAUDE.local.md`、`.claude/settings.local.json` 等仅本地文件必须
+显式使用 `--local-project-env`。同步多个项目时，重复提供 `--project-map SOURCE=TARGET`；
+映射是显式的，不依赖参数顺序。离线导入只暴露不透明项目 ID，并使用
+`--target-project PROJECT_ID=TARGET` 指定目标。
+
+认证数据库、OAuth/账号状态、Provider 路由、Codex trust 和用户级 Codex MCP server 表
+不会同步。JSON 中疑似秘密的字段会被移除；如果 MCP command 参数数组包含凭据参数名或
+已识别的令牌前缀，整个参数数组都会被清空，需要在目标机器重新配置该命令。自由格式的
+指令和命令仍可能包含私密内容，因此传输前应审查所选文件，并使用加密导出或可信 SSH 对端。
 
 可以对任意命令使用 `--help` 查看当前选项和安全提示。
 
