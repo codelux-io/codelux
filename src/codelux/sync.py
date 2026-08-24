@@ -3,6 +3,8 @@
 import hashlib
 import io
 import json
+import os
+import re
 import secrets
 import sqlite3
 import struct
@@ -27,7 +29,16 @@ MAX_FILE = 256 * 1024 * 1024
 MAX_FILES = 100_000
 MAX_TOTAL = 4 * 1024 * 1024 * 1024
 SCRYPT_MAXMEM = 256 * 1024 * 1024
-SELECTIONS = {"config", "sessions", "providers"}
+SELECTIONS = {
+    "config",
+    "sessions",
+    "providers",
+    "project_env",
+    "local_env",
+    "user_env",
+    "memory",
+}
+SyncSource = Union[Path, bytes]
 SYNC_STATE_SCHEMA = 1
 SQLITE_BACKUP_ATTEMPTS = 10
 SQLITE_BACKUP_BACKOFF_SECONDS = 0.1
@@ -63,9 +74,10 @@ class SyncManifest:
     includes_keys: bool
     files: tuple[SyncFile, ...]
     schema_version: int = 1
+    project_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "transfer_id": self.transfer_id,
             "created_at": self.created_at,
@@ -74,10 +86,16 @@ class SyncManifest:
             "includes_keys": self.includes_keys,
             "files": [item.to_dict() for item in self.files],
         }
+        if self.schema_version == 2:
+            payload["project_ids"] = list(self.project_ids)
+        return payload
 
     @classmethod
     def from_dict(cls, data: Any) -> "SyncManifest":
-        if not isinstance(data, dict) or set(data) != {
+        if not isinstance(data, dict):
+            raise ValidationError("sync manifest is invalid")
+        schema_version = data.get("schema_version")
+        expected = {
             "schema_version",
             "transfer_id",
             "created_at",
@@ -85,12 +103,26 @@ class SyncManifest:
             "selection",
             "includes_keys",
             "files",
-        }:
+        }
+        if schema_version == 2:
+            expected.add("project_ids")
+        if set(data) != expected:
             raise ValidationError("sync manifest is invalid")
-        if data["schema_version"] != 1 or not isinstance(data["includes_keys"], bool):
+        if schema_version not in {1, 2} or not isinstance(data["includes_keys"], bool):
             raise ValidationError("sync manifest is invalid")
-        for field in ("transfer_id", "created_at", "source_machine_id"):
-            if not isinstance(data[field], str) or not data[field]:
+        raw_project_ids = data.get("project_ids", [])
+        if (
+            not isinstance(raw_project_ids, list)
+            or any(not isinstance(item, str) for item in raw_project_ids)
+            or tuple(raw_project_ids) != tuple(sorted(set(raw_project_ids)))
+        ):
+            raise ValidationError("sync manifest is invalid")
+        project_ids = tuple(raw_project_ids)
+        for project_id in project_ids:
+            if re.fullmatch(r"p-[0-9a-f]{24}", project_id) is None:
+                raise ValidationError("sync manifest is invalid")
+        for field_name in ("transfer_id", "created_at", "source_machine_id"):
+            if not isinstance(data[field_name], str) or not data[field_name]:
                 raise ValidationError("sync manifest is invalid")
         try:
             parsed = datetime.fromisoformat(data["created_at"].replace("Z", "+00:00"))
@@ -141,6 +173,13 @@ class SyncManifest:
                 raise ValidationError("sync manifest is invalid")
             seen.add(path)
             files.append(SyncFile(path, mode, size, digest))
+        if set(selection).intersection({"project_env", "local_env", "memory"}) and not project_ids:
+            raise ValidationError("sync manifest is invalid")
+        for item in files:
+            if item.path.startswith(("project-env/", "project-memory/")):
+                parts = PurePosixPath(item.path).parts
+                if len(parts) < 3 or parts[1] not in project_ids:
+                    raise ValidationError("sync manifest is invalid")
         return cls(
             data["transfer_id"],
             data["created_at"],
@@ -148,7 +187,8 @@ class SyncManifest:
             tuple(selection),
             data["includes_keys"],
             tuple(files),
-            1,
+            schema_version,
+            project_ids,
         )
 
 
@@ -210,11 +250,16 @@ def _baseline_key(remote_id: str, selection: Sequence[str]) -> str:
     return remote_id + ":" + ",".join(sorted(set(selection)))
 
 
-def _baseline_bytes(root: Path, manifest: SyncManifest) -> bytes:
+def _baseline_bytes(
+    root: Path,
+    manifest: SyncManifest,
+    applied_hashes: Optional[Mapping[str, str]] = None,
+) -> bytes:
     state = load_sync_state(root)
+    hashes = applied_hashes or {}
     state["baselines"][_baseline_key(manifest.source_machine_id, manifest.selection)] = {
         "transfer_id": manifest.transfer_id,
-        "files": {item.path: item.sha256 for item in manifest.files},
+        "files": {item.path: hashes.get(item.path, item.sha256) for item in manifest.files},
     }
     return (json.dumps(state, sort_keys=True, indent=2) + "\n").encode()
 
@@ -575,19 +620,290 @@ def _derive_key(password: str, salt: bytes) -> bytes:
         raise ValidationError("sync encryption parameters are unavailable on this host") from exc
 
 
+PROJECT_INSTRUCTION_NAMES = {"AGENTS.md", "AGENTS.override.md", "CLAUDE.md"}
+PROJECT_SHARED_DIRS = {
+    (".agents", "skills"),
+    (".claude", "rules"),
+    (".claude", "skills"),
+    (".claude", "agents"),
+    (".claude", "commands"),
+    (".claude", "output-styles"),
+    (".codex", "rules"),
+    (".codex", "hooks"),
+}
+USER_ENV_DIRS = {
+    (".agents", "skills"),
+    (".claude", "rules"),
+    (".claude", "skills"),
+    (".claude", "agents"),
+    (".claude", "commands"),
+    (".claude", "output-styles"),
+    (".codex", "rules"),
+    (".codex", "hooks"),
+}
+WALK_PRUNE_NAMES = {
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+}
+
+
+def _project_id(project_root: Path) -> str:
+    value = str(project_root.expanduser().absolute())
+    return "p-" + hashlib.sha256(value.encode()).hexdigest()[:24]
+
+
+def _project_metadata(project_roots: Sequence[Path]) -> dict[str, str]:
+    projects: dict[str, str] = {}
+    seen_roots = set()
+    for value in project_roots:
+        absolute = Path(os.path.abspath(value.expanduser()))
+        if absolute.is_symlink():
+            raise ValidationError(f"project root is missing or unsafe: {absolute}")
+        try:
+            resolved = absolute.resolve(strict=True)
+        except OSError as exc:
+            raise ValidationError(f"project root is missing or unsafe: {value}") from exc
+        root = absolute
+        if root in seen_roots:
+            continue
+        if not resolved.is_dir():
+            raise ValidationError(f"project root is missing or unsafe: {root}")
+        project_id = _project_id(absolute)
+        if project_id in projects and projects[project_id] != str(root):
+            raise ValidationError("project identity collision")
+        projects[project_id] = str(root)
+        seen_roots.add(root)
+    return projects
+
+
+def _codex_fallback_names(home: Path) -> set[str]:
+    path = home / ".codex" / "config.toml"
+    if not path.is_file() or path.is_symlink():
+        return set()
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return set()
+    match = re.search(r"(?m)^\s*project_doc_fallback_filenames\s*=\s*\[(.*?)\]", text, re.S)
+    if match is None:
+        return set()
+    names = set(re.findall(r"""["']([^"']+)["']""", match.group(1)))
+    return {name for name in names if name and Path(name).name == name and "/" not in name}
+
+
+def _walk_regular_files(root: Path, *, reject_symlinks: bool = True) -> Iterable[Path]:
+    if not root.exists():
+        return ()
+    if root.is_symlink() or not root.is_dir():
+        raise ValidationError(f"sync path is unsafe: {root}")
+    result: list[Path] = []
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        safe_directories = []
+        for name in directories:
+            candidate = current_path / name
+            if name in WALK_PRUNE_NAMES:
+                continue
+            if candidate.is_symlink():
+                continue
+            safe_directories.append(name)
+        directories[:] = safe_directories
+        for name in files:
+            path = current_path / name
+            if path.is_symlink():
+                if reject_symlinks:
+                    raise ValidationError(f"sync path is a symbolic link: {path}")
+                result.append(path)
+                continue
+            if not path.is_file():
+                raise ValidationError(f"sync path is not a regular file: {path}")
+            result.append(path)
+    return tuple(result)
+
+
+def _project_file_allowed(relative: Path, local: bool, fallback_names: set[str]) -> bool:
+    if relative.name == "CLAUDE.local.md":
+        return local
+    if relative.name in PROJECT_INSTRUCTION_NAMES or relative.name in fallback_names:
+        return True
+    if relative == Path(".mcp.json") or relative == Path(".claude/settings.json"):
+        return True
+    if relative == Path(".claude/settings.local.json"):
+        return local
+    if relative == Path(".codex/config.toml"):
+        return True
+    return any(relative.parts[: len(prefix)] == prefix for prefix in PROJECT_SHARED_DIRS)
+
+
+def _claude_imports(project_root: Path, seeds: Sequence[Path]) -> tuple[Path, ...]:
+    try:
+        resolved_root = project_root.resolve(strict=True)
+    except OSError as exc:
+        raise ValidationError("project root is missing or unsafe") from exc
+    pending = []
+    for seed in seeds:
+        if seed.name != "CLAUDE.md":
+            continue
+        try:
+            resolved_seed = seed.resolve(strict=True)
+            resolved_seed.relative_to(resolved_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        pending.append((seed.absolute(), 0))
+    found = set()
+    while pending:
+        path, depth = pending.pop()
+        if depth >= 4:
+            continue
+        try:
+            lines = path.read_text().splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        fenced = False
+        for line in lines:
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+                continue
+            if fenced:
+                continue
+            without_inline_code = re.sub(r"`[^`]*`", "", line)
+            for raw in re.findall(r"(?<!\w)@([^\s`]+)", without_inline_code):
+                candidate_text = raw.rstrip(".,;:)]}")
+                candidate = Path(candidate_text)
+                if "~" in candidate_text or candidate.is_absolute():
+                    continue
+                logical_candidate = (path.parent / candidate).absolute()
+                try:
+                    resolved_candidate = logical_candidate.resolve(strict=True)
+                    resolved_candidate.relative_to(resolved_root)
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                if not resolved_candidate.is_file():
+                    continue
+                if logical_candidate not in found:
+                    found.add(logical_candidate)
+                    pending.append((logical_candidate, depth + 1))
+    return tuple(sorted(found))
+
+
+def _collect_project_environment(
+    home: Path, projects: Mapping[str, str], include_local: bool
+) -> tuple[tuple[str, Path], ...]:
+    fallback_names = _codex_fallback_names(home)
+    result = []
+    for project_id, source in projects.items():
+        root = Path(source)
+        selected = []
+        for path in _walk_regular_files(root, reject_symlinks=False):
+            relative = path.relative_to(root)
+            if _project_file_allowed(relative, include_local, fallback_names):
+                if path.is_symlink():
+                    raise ValidationError(f"sync path is a symbolic link: {path}")
+                selected.append(path)
+        selected.extend(path for path in _claude_imports(root, selected) if path not in selected)
+        for path in sorted(selected):
+            relative_text = path.relative_to(root).as_posix()
+            result.append((f"project-env/{project_id}/{relative_text}", path))
+    return tuple(result)
+
+
+def _collect_user_environment(home: Path) -> tuple[tuple[str, Path], ...]:
+    roots = []
+    direct = {
+        "user-env/codex/AGENTS.md": home / ".codex" / "AGENTS.md",
+        "user-env/codex/AGENTS.override.md": home / ".codex" / "AGENTS.override.md",
+        "user-env/codex/config.toml": home / ".codex" / "config.toml",
+        "user-env/claude/CLAUDE.md": home / ".claude" / "CLAUDE.md",
+        "user-env/claude/settings.json": home / ".claude" / "settings.json",
+    }
+    for logical, path in direct.items():
+        if path.is_symlink():
+            raise ValidationError(f"sync path is a symbolic link: {path}")
+        if path.is_file():
+            roots.append((logical, path))
+    codex_root = home / ".codex"
+    if codex_root.is_dir() and not codex_root.is_symlink():
+        for path in sorted(codex_root.glob("*.config.toml")):
+            if path.is_symlink():
+                raise ValidationError(f"sync path is a symbolic link: {path}")
+            if path.is_file():
+                roots.append((f"user-env/codex/{path.name}", path))
+    for prefix in USER_ENV_DIRS:
+        base = home.joinpath(*prefix)
+        for path in _walk_regular_files(base):
+            logical_root = "user-env/" + "/".join(prefix).lstrip(".")
+            roots.append((f"{logical_root}/{path.relative_to(base).as_posix()}", path))
+    return tuple(roots)
+
+
+def _collect_project_memory(
+    home: Path, projects: Mapping[str, str]
+) -> tuple[tuple[str, Path], ...]:
+    result = []
+    for project_id, source in projects.items():
+        memory_root = home / ".claude" / "projects" / _claude_project_slug(Path(source)) / "memory"
+        for path in _walk_regular_files(memory_root):
+            if path.suffix == ".md":
+                result.append(
+                    (
+                        f"project-memory/{project_id}/{path.relative_to(memory_root).as_posix()}",
+                        path,
+                    )
+                )
+    return tuple(result)
+
+
+def _claude_local_mcp_source(home: Path, projects: Mapping[str, str]) -> Optional[bytes]:
+    path = home / ".claude.json"
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise ValidationError("Claude local project configuration is unsafe")
+    try:
+        data = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError("Claude local project configuration is invalid") from exc
+    if not isinstance(data, dict):
+        raise ValidationError("Claude local project configuration is invalid")
+    configured = data.get("projects", {})
+    if not isinstance(configured, dict):
+        raise ValidationError("Claude local project configuration is invalid")
+    if not any(source in configured for source in projects.values()):
+        return None
+    return _claude_local_mcp_content(path, projects)
+
+
 def collect_files(
     home: Path,
     selections: Sequence[str],
     include_keys: bool = False,
     clients: Optional[Sequence[str]] = None,
-) -> tuple[tuple[str, Path], ...]:
+    project_roots: Sequence[Path] = (),
+) -> tuple[tuple[str, SyncSource], ...]:
     selected = set(selections)
     if not selected or not selected.issubset(SELECTIONS):
         raise ValidationError("at least one supported sync selection is required")
     client_set = {"claude", "codex"} if clients is None else set(clients)
     if not client_set.issubset({"claude", "codex"}):
         raise ValidationError("unsupported sync client")
-    roots: list[tuple[str, Path]] = []
+    projects = _project_metadata(project_roots)
+    if selected.intersection({"project_env", "local_env", "memory"}) and not projects:
+        raise ValidationError("project environment synchronization requires a project root")
+    if "local_env" in selected and "project_env" not in selected:
+        raise ValidationError("local project environment requires project environment selection")
+    roots: list[tuple[str, SyncSource]] = []
     if "config" in selected:
         if "claude" in client_set:
             roots.append(("claude/settings.json", home / ".claude/settings.json"))
@@ -607,6 +923,16 @@ def collect_files(
                 roots.append(("codex/auth.json", auth_path))
     if "providers" in selected:
         roots.append(("codelux/providers.json", home / ".codelux/providers.json"))
+    if "project_env" in selected:
+        roots.extend(_collect_project_environment(home, projects, "local_env" in selected))
+    if "local_env" in selected:
+        local_mcp = _claude_local_mcp_source(home, projects)
+        if local_mcp is not None:
+            roots.append(("project-local-mcp.json", local_mcp))
+    if "user_env" in selected:
+        roots.extend(_collect_user_environment(home))
+    if "memory" in selected:
+        roots.extend(_collect_project_memory(home, projects))
     if "sessions" in selected:
         session_roots = []
         if "claude" in client_set:
@@ -633,12 +959,20 @@ def collect_files(
             if db.is_symlink():
                 raise ValidationError("Codex SQLite path is a symbolic link")
             roots.append(("codex/state_5.sqlite", db))
-    result = []
-    for logical, path in roots:
+    result: list[tuple[str, SyncSource]] = []
+    seen_sources = set()
+    for logical, source_item in roots:
         _safe_relative(logical)
+        if isinstance(source_item, bytes):
+            result.append((logical, source_item))
+            continue
+        path = source_item
         if path.is_symlink():
             raise ValidationError(f"sync path is a symbolic link: {logical}")
         if path.is_file():
+            source = path.absolute()
+            if source in seen_sources:
+                continue
             if path.stat().st_nlink > 1 and logical in {
                 "claude/.credentials.json",
                 "codex/auth.json",
@@ -646,6 +980,7 @@ def collect_files(
             }:
                 raise ValidationError(f"sensitive sync file has multiple hard links: {logical}")
             result.append((logical, path))
+            seen_sources.add(source)
     return tuple(result)
 
 
@@ -654,24 +989,31 @@ def build_manifest(
     selections: Sequence[str],
     include_keys: bool = False,
     clients: Optional[Sequence[str]] = None,
-) -> tuple[SyncManifest, tuple[tuple[str, Path], ...]]:
+    project_roots: Sequence[Path] = (),
+) -> tuple[SyncManifest, tuple[tuple[str, SyncSource], ...]]:
     if "providers" in selections and not include_keys:
         raise ValidationError("Provider synchronization requires credentials; omit --no-keys")
-    files = collect_files(home, selections, include_keys, clients)
+    projects = _project_metadata(project_roots)
+    files = collect_files(home, selections, include_keys, clients, project_roots)
     if len(files) > MAX_FILES:
         raise ValidationError("sync file count exceeds limit")
     entries = []
     total = 0
     for logical, path in files:
-        if logical == "codex/state_5.sqlite":
+        if isinstance(path, bytes):
+            size, digest = len(path), hashlib.sha256(path).hexdigest()
+            mode = 0o600
+        elif logical == "codex/state_5.sqlite":
             content = _sqlite_backup_bytes(path)
             size, digest = len(content), hashlib.sha256(content).hexdigest()
+            mode = path.stat().st_mode & 0o777
         else:
             size, digest = _hash_file(path)
+            mode = path.stat().st_mode & 0o777
         total += size
         if total > MAX_TOTAL:
             raise ValidationError("sync content exceeds 4 GiB")
-        entries.append(SyncFile(logical, path.stat().st_mode & 0o777, size, digest))
+        entries.append(SyncFile(logical, mode, size, digest))
     manifest = SyncManifest(
         secrets.token_hex(16),
         datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -679,6 +1021,8 @@ def build_manifest(
         tuple(sorted(set(selections))),
         include_keys,
         tuple(entries),
+        2 if projects else 1,
+        tuple(sorted(projects)),
     )
     return manifest, files
 
@@ -715,17 +1059,127 @@ def _source_content(logical: str, path: Union[Path, bytes], includes_keys: bool)
         return path
     if logical == "codex/state_5.sqlite":
         return _sqlite_backup_bytes(path)
-    return path.read_bytes()
+    content = path.read_bytes()
+    if logical.startswith("user-env/codex/") and logical.endswith(("config.toml", ".config.toml")):
+        return _sanitize_codex_user_config(content)
+    if (
+        logical in {"user-env/claude/settings.json"}
+        or logical.endswith("/.mcp.json")
+        or logical.endswith("/.claude/settings.json")
+        or logical.endswith("/.claude/settings.local.json")
+    ):
+        return _sanitize_json_environment(
+            content, strip_claude_routing=logical.startswith("user-env/")
+        )
+    return content
+
+
+def _claude_local_mcp_content(path: Path, projects: Mapping[str, str]) -> bytes:
+    try:
+        data = json.loads(path.read_bytes())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError("Claude local project configuration is invalid") from exc
+    if not isinstance(data, dict):
+        raise ValidationError("Claude local project configuration is invalid")
+    configured = data.get("projects", {})
+    if not isinstance(configured, dict):
+        raise ValidationError("Claude local project configuration is invalid")
+    result = {}
+    for project_id, source in projects.items():
+        project = configured.get(source)
+        if not isinstance(project, dict) or "mcpServers" not in project:
+            continue
+        servers = project["mcpServers"]
+        if not isinstance(servers, dict):
+            raise ValidationError("Claude local project MCP configuration is invalid")
+        sanitized = json.loads(
+            _sanitize_json_environment(json.dumps(servers).encode(), strip_claude_routing=False)
+        )
+        result[project_id] = sanitized
+    return (json.dumps(result, sort_keys=True, indent=2) + "\n").encode()
+
+
+def _sanitize_codex_user_config(content: bytes) -> bytes:
+    try:
+        lines = content.decode().splitlines(keepends=True)
+    except UnicodeDecodeError as exc:
+        raise ValidationError("Codex user configuration is invalid") from exc
+    result = []
+    skip_provider_table = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            skip_provider_table = stripped.startswith(
+                ("[model_providers.", "[projects.", "[mcp_servers.")
+            ) or stripped in {"[model_providers]", "[projects]", "[mcp_servers]"}
+        if skip_provider_table:
+            continue
+        if re.match(r"^(model_provider|openai_base_url|chatgpt_base_url)\s*=", stripped):
+            continue
+        result.append(line)
+    return "".join(result).encode()
+
+
+def _sanitize_json_environment(content: bytes, *, strip_claude_routing: bool) -> bytes:
+    try:
+        data = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError("agent environment JSON is invalid") from exc
+
+    def arguments_may_contain_secret(values: Sequence[Any]) -> bool:
+        option = re.compile(
+            r"(^|[^a-z0-9])(api[-_]?key|token|password|passwd|secret|authorization|cookie|credential)(=|$)",
+            re.I,
+        )
+        secret_value = re.compile(r"^(sk[-_]|gh[pousr]_|github_pat_|xox[baprs]-|bearer\s+)", re.I)
+        return any(
+            isinstance(item, str) and (option.search(item) is not None or secret_value.search(item))
+            for item in values
+        )
+
+    def clean(value: Any, parent: Optional[str] = None) -> Any:
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                normalized = str(key).upper()
+                sensitive = any(
+                    marker in normalized
+                    for marker in (
+                        "TOKEN",
+                        "SECRET",
+                        "PASSWORD",
+                        "API_KEY",
+                        "AUTHORIZATION",
+                        "COOKIE",
+                    )
+                )
+                routing = (
+                    strip_claude_routing and parent == "env" and normalized.startswith("ANTHROPIC_")
+                )
+                if sensitive or routing:
+                    continue
+                result[key] = clean(item, str(key))
+            return result
+        if isinstance(value, list):
+            if (
+                parent is not None
+                and parent.upper() in {"ARGS", "ARGUMENTS", "COMMAND_ARGS"}
+                and arguments_may_contain_secret(value)
+            ):
+                return []
+            return [clean(item, parent) for item in value]
+        return value
+
+    return (json.dumps(clean(data), sort_keys=True, indent=2) + "\n").encode()
 
 
 def materialize_sync_files(
-    manifest: SyncManifest, files: Iterable[tuple[str, Union[Path, bytes]]]
+    manifest: SyncManifest, files: Iterable[tuple[str, SyncSource]]
 ) -> tuple[SyncManifest, dict[str, bytes]]:
     """Capture one stable byte snapshot and align manifest hashes with it."""
-    payload = {
-        logical: _source_content(logical, source, manifest.includes_keys)
-        for logical, source in files
-    }
+    payload = {}
+    for logical, source in files:
+        payload[logical] = _source_content(logical, source, manifest.includes_keys)
     entries = tuple(
         replace(
             entry,
@@ -738,7 +1192,7 @@ def materialize_sync_files(
 
 
 def export_encrypted(
-    manifest: SyncManifest, files: Iterable[tuple[str, Path]], password: str, output: Path
+    manifest: SyncManifest, files: Iterable[tuple[str, SyncSource]], password: str, output: Path
 ) -> None:
     if len(password) < 12:
         raise ValidationError("sync password must contain at least 12 characters")
@@ -751,7 +1205,8 @@ def export_encrypted(
     output = output.absolute()
     if output.exists() or output.is_symlink():
         raise ValidationError("sync output already exists")
-    payload = create_plain_archive(manifest, files)
+    manifest, materialized = materialize_sync_files(manifest, files)
+    payload = create_plain_archive(manifest, tuple(materialized.items()))
     salt = secrets.token_bytes(32)
     nonce = secrets.token_bytes(12)
     key = _derive_key(password, salt)
@@ -769,9 +1224,7 @@ def export_encrypted(
     )
 
 
-def create_plain_archive(
-    manifest: SyncManifest, files: Iterable[tuple[str, Union[Path, bytes]]]
-) -> bytes:
+def create_plain_archive(manifest: SyncManifest, files: Iterable[tuple[str, SyncSource]]) -> bytes:
     with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as plain:
         with tarfile.open(fileobj=plain, mode="w") as archive:
             raw_manifest = json.dumps(
@@ -983,6 +1436,43 @@ def _merge_provider_registry(target: Path, incoming: bytes, overwrite: bool) -> 
     return (json.dumps(current, sort_keys=True, indent=2) + "\n").encode()
 
 
+def _merge_claude_local_mcp(
+    target: Path,
+    incoming_bytes: bytes,
+    target_roots: Mapping[str, str],
+    overwrite: bool,
+) -> bytes:
+    try:
+        incoming = json.loads(incoming_bytes)
+        current = json.loads(target.read_bytes()) if target.is_file() else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError("Claude local project configuration is invalid") from exc
+    if not isinstance(incoming, dict) or not isinstance(current, dict):
+        raise ValidationError("Claude local project configuration is invalid")
+    current_projects = current.setdefault("projects", {})
+    if not isinstance(current_projects, dict):
+        raise ValidationError("Claude local project configuration is invalid")
+    for project_id, incoming_servers in incoming.items():
+        if project_id not in target_roots or not isinstance(incoming_servers, dict):
+            raise ValidationError("Claude local project MCP mapping is invalid")
+        target_root = target_roots[project_id]
+        project = current_projects.setdefault(target_root, {})
+        if not isinstance(project, dict):
+            raise ValidationError("Claude local project configuration is invalid")
+        current_servers = project.setdefault("mcpServers", {})
+        if not isinstance(current_servers, dict):
+            raise ValidationError("Claude local project configuration is invalid")
+        for name, server in incoming_servers.items():
+            existing = current_servers.get(name)
+            if existing is None or existing == server or overwrite:
+                current_servers[name] = server
+            else:
+                raise ValidationError(
+                    f"Claude project MCP conflict requires --overwrite: {target_root}/{name}"
+                )
+    return (json.dumps(current, sort_keys=True, indent=2) + "\n").encode()
+
+
 def apply_import(
     home: Path,
     manifest: SyncManifest,
@@ -990,6 +1480,7 @@ def apply_import(
     overwrite: Union[bool, Mapping[str, bool]] = False,
     claude_project_root: Optional[Path] = None,
     codex_project_roots: Optional[Mapping[str, Path]] = None,
+    environment_project_roots: Optional[Mapping[str, Path]] = None,
     operation_type: str = "sync_import",
 ) -> tuple[str, ...]:
     """Apply a fully validated archive as one compensating local transaction."""
@@ -1007,6 +1498,25 @@ def apply_import(
             manifest, files, {next(iter(source_slugs)): claude_project_root.absolute()}
         )
     manifest, files = map_codex_sessions(manifest, files, home.absolute(), codex_project_roots)
+    referenced_projects = {
+        entry.path.split("/", 2)[1]
+        for entry in manifest.files
+        if entry.path.startswith(("project-env/", "project-memory/"))
+    }
+    if any(entry.path == "project-local-mcp.json" for entry in manifest.files):
+        referenced_projects.update(manifest.project_ids)
+    supplied_projects = dict(environment_project_roots or {})
+    if referenced_projects.difference(supplied_projects) or set(supplied_projects).difference(
+        manifest.project_ids
+    ):
+        raise ValidationError("project environment mapping is incomplete")
+    target_roots: dict[str, str] = {}
+    for project_id, target_root in supplied_projects.items():
+        target = target_root.expanduser().absolute()
+        if project_id not in manifest.project_ids or not target.is_dir() or target.is_symlink():
+            raise ValidationError("project environment target is missing or unsafe")
+        if project_id in referenced_projects:
+            target_roots[project_id] = str(target)
     root = home / ".codelux"
     # machine-id is diagnostic metadata only; equal identities do not block a clone.
     baseline = load_sync_state(root)["baselines"].get(
@@ -1022,14 +1532,14 @@ def apply_import(
     def allows(path: str) -> bool:
         if isinstance(overwrite, bool):
             return overwrite
-        if path.startswith("claude/"):
+        if path.startswith("claude/") or path == "project-local-mcp.json":
             return bool(overwrite.get("claude"))
         if path.startswith("codex/"):
             return bool(overwrite.get("codex"))
         return bool(overwrite.get("providers"))
 
     for entry in manifest.files:
-        target = _logical_target(home, entry.path)
+        target = _logical_target(home, entry.path, target_roots)
         if target.is_symlink():
             raise ValidationError("sync target is a symbolic link")
         incoming = files[entry.path]
@@ -1038,6 +1548,9 @@ def apply_import(
         provider_merge = entry.path == "codelux/providers.json"
         if provider_merge:
             incoming = _merge_provider_registry(target, incoming, allows(entry.path))
+        local_mcp_merge = entry.path == "project-local-mcp.json"
+        if local_mcp_merge:
+            incoming = _merge_claude_local_mcp(target, incoming, target_roots, allows(entry.path))
         current_hash = (
             hashlib.sha256(compare_before).hexdigest() if compare_before is not None else None
         )
@@ -1046,7 +1559,12 @@ def apply_import(
         if before is None:
             if old_hash is not None:
                 missing.append(entry.path)
-        elif not provider_merge and current_hash != incoming_hash and current_hash != old_hash:
+        elif (
+            not provider_merge
+            and not local_mcp_merge
+            and current_hash != incoming_hash
+            and current_hash != old_hash
+        ):
             conflicts.append(entry.path)
         prepared.append(
             _PreparedWrite(
@@ -1064,11 +1582,14 @@ def apply_import(
 
     baseline_target = _state_path(root)
     baseline_before = baseline_target.read_bytes() if baseline_target.is_file() else None
+    applied_hashes = {
+        item.logical_path: hashlib.sha256(item.incoming).hexdigest() for item in prepared
+    }
     prepared.append(
         _PreparedWrite(
             "codelux/sync-state.json",
             baseline_target,
-            _baseline_bytes(root, manifest),
+            _baseline_bytes(root, manifest, applied_hashes),
             baseline_before,
             baseline_target.stat().st_mode & 0o777 if baseline_before is not None else 0o600,
             0o600,
@@ -1108,6 +1629,7 @@ def apply_import(
             {},
             {},
             tuple(manifest_files),
+            target_roots=target_roots,
         )
         store.write_manifest(operation)
     except CodeluxError:

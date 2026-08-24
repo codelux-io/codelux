@@ -24,6 +24,7 @@ from codelux.sync import (
     import_encrypted,
     load_sync_state,
     map_codex_sessions,
+    materialize_sync_files,
     reset_baseline,
     rotate_machine_id,
     save_baseline,
@@ -38,6 +39,7 @@ from codelux.sync_transport import (
     pull_archive,
     push_archive,
     read_capability,
+    read_path_payload,
     ssh_command,
     validate_capability,
 )
@@ -78,6 +80,8 @@ def test_sync_manifest_schema_is_fail_closed(tmp_path: Path, monkeypatch) -> Non
     manifest, _ = build_manifest(home, ["config"])
     valid = manifest.to_dict()
     invalid_cases = []
+    with pytest.raises(ValidationError, match="sync manifest is invalid"):
+        sync_module.SyncManifest.from_dict(None)
 
     missing_key = dict(valid)
     missing_key.pop("transfer_id")
@@ -108,6 +112,31 @@ def test_sync_manifest_schema_is_fail_closed(tmp_path: Path, monkeypatch) -> Non
     monkeypatch.setattr(sync_module, "MAX_TOTAL", 0)
     with pytest.raises(ValidationError, match="sync manifest is invalid"):
         sync_module.SyncManifest.from_dict(valid)
+
+
+def test_sync_manifest_v2_project_metadata_is_strict(tmp_path: Path) -> None:
+    home = _home(tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("rules\n")
+    manifest, _ = build_manifest(home, ["project_env"], project_roots=(project,))
+    raw = manifest.to_dict()
+    assert sync_module.SyncManifest.from_dict(raw) == manifest
+    assert str(project) not in json.dumps(raw)
+
+    project_id = manifest.project_ids[0]
+    foreign_file = dict(raw["files"][0])
+    foreign_file["path"] = "project-env/p-ffffffffffffffffffffffff/AGENTS.md"
+    invalid = [
+        {**raw, "project_ids": {}},
+        {**raw, "project_ids": ["bad"]},
+        {**raw, "project_ids": [project_id, project_id]},
+        {**raw, "project_ids": []},
+        {**raw, "files": [foreign_file]},
+    ]
+    for value in invalid:
+        with pytest.raises(ValidationError, match="sync manifest is invalid"):
+            sync_module.SyncManifest.from_dict(value)
 
 
 def test_encrypted_export_import_round_trip(tmp_path: Path) -> None:
@@ -223,6 +252,374 @@ def test_sessions_ignore_regular_metadata_files(tmp_path: Path) -> None:
     (projects / "session.jsonl").write_text('{"type":"message"}\n')
     manifest, _ = build_manifest(home, ["sessions"])
     assert [item.path for item in manifest.files] == ["claude/projects/example/session.jsonl"]
+
+
+def test_project_environment_collects_agent_files_and_requires_local_opt_in(
+    tmp_path: Path,
+) -> None:
+    home = _home(tmp_path / "home")
+    (home / ".codex/config.toml").write_text(
+        'model_provider = "openai"\nproject_doc_fallback_filenames = ["TEAM_GUIDE.md"]\n'
+    )
+    project = tmp_path / "project"
+    (project / ".claude/rules").mkdir(parents=True)
+    (project / ".agents/skills/review").mkdir(parents=True)
+    (project / ".codex").mkdir()
+    (project / "src").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("must not sync\n")
+    (project / "linked").symlink_to(outside, target_is_directory=True)
+    (project / "AGENTS.md").write_text("codex\n")
+    (project / "CLAUDE.md").write_text(
+        "Read @docs/workflow.md\nReject @linked/secret.md\nReject @~/secret.md\n"
+    )
+    (project / "CLAUDE.local.md").write_text("private\n")
+    (project / "TEAM_GUIDE.md").write_text("fallback\n")
+    (project / ".mcp.json").write_text("{}\n")
+    (project / ".claude/settings.json").write_text("{}\n")
+    (project / ".claude/settings.local.json").write_text("{}\n")
+    (project / ".claude/rules/testing.md").write_text("tests\n")
+    (project / ".agents/skills/review/SKILL.md").write_text("review\n")
+    (project / ".codex/config.toml").write_text('sandbox_mode = "workspace-write"\n')
+    (project / "src/AGENTS.override.md").write_text("nested\n")
+    (project / "docs").mkdir()
+    (project / "docs/workflow.md").write_text("workflow\n")
+    (project / ".env").write_text("SECRET=no\n")
+
+    shared, _ = build_manifest(home, ["project_env"], project_roots=(project,))
+    shared_paths = {item.path.split("/", 2)[2] for item in shared.files}
+    assert {
+        "AGENTS.md",
+        "CLAUDE.md",
+        "TEAM_GUIDE.md",
+        ".mcp.json",
+        ".claude/settings.json",
+        ".claude/rules/testing.md",
+        ".agents/skills/review/SKILL.md",
+        ".codex/config.toml",
+        "src/AGENTS.override.md",
+        "docs/workflow.md",
+    }.issubset(shared_paths)
+    assert "CLAUDE.local.md" not in shared_paths
+    assert ".claude/settings.local.json" not in shared_paths
+    assert ".env" not in shared_paths
+    assert "linked/secret.md" not in shared_paths
+    assert all("secret.md" not in path for path in shared_paths)
+
+    local, _ = build_manifest(home, ["project_env", "local_env"], project_roots=(project,))
+    local_paths = {item.path.split("/", 2)[2] for item in local.files}
+    assert {"CLAUDE.local.md", ".claude/settings.local.json"}.issubset(local_paths)
+
+
+def test_user_environment_excludes_authentication_and_collects_extensions(tmp_path: Path) -> None:
+    home = _home(tmp_path / "home")
+    (home / ".codex/AGENTS.md").write_text("global\n")
+    (home / ".codex/work.config.toml").write_text('model = "test"\n')
+    (home / ".codex/auth.json").write_text('{"token":"never"}\n')
+    (home / ".agents/skills/tool").mkdir(parents=True)
+    (home / ".agents/skills/tool/SKILL.md").write_text("tool\n")
+    (home / ".claude/agents").mkdir()
+    (home / ".claude/agents/reviewer.md").write_text("review\n")
+    (home / ".claude/.credentials.json").write_text('{"token":"never"}\n')
+    (home / ".claude.json").write_text('{"oauth":"never"}\n')
+
+    manifest, _ = build_manifest(home, ["user_env"])
+    paths = {item.path for item in manifest.files}
+    assert "user-env/codex/AGENTS.md" in paths
+    assert "user-env/codex/work.config.toml" in paths
+    assert "user-env/agents/skills/tool/SKILL.md" in paths
+    assert "user-env/claude/agents/reviewer.md" in paths
+    assert all("auth.json" not in path and "credentials" not in path for path in paths)
+
+    manifest, sources = materialize_sync_files(manifest, _)
+    target = _home(tmp_path / "target")
+    apply_import(target, manifest, sources, overwrite=True)
+    assert (target / ".codex/AGENTS.md").read_text() == "global\n"
+    assert (target / ".codex/work.config.toml").read_text() == 'model = "test"\n'
+    assert (target / ".agents/skills/tool/SKILL.md").read_text() == "tool\n"
+    assert (target / ".claude/agents/reviewer.md").read_text() == "review\n"
+
+
+def test_agent_environment_sanitizers_remove_routing_trust_and_secrets() -> None:
+    codex = sync_module._sanitize_codex_user_config(
+        b'model = "gpt"\nmodel_provider = "private"\n'
+        b'[model_providers.private]\nbase_url = "https://secret"\n'
+        b'[projects."/source"]\ntrust_level = "trusted"\n'
+        b'[mcp_servers.private]\ncommand = "node"\n'
+        b'[mcp_servers.private.env]\nAPI_KEY = "never"\n'
+        b"[features]\nweb_search = true\n"
+    )
+    assert b'model = "gpt"' in codex
+    assert b"model_provider" not in codex
+    assert b"model_providers" not in codex
+    assert b"trust_level" not in codex
+    assert b"mcp_servers" not in codex
+    assert b"API_KEY" not in codex
+    assert b"web_search = true" in codex
+    with pytest.raises(ValidationError, match="Codex user configuration"):
+        sync_module._sanitize_codex_user_config(b"\xff")
+
+    cleaned = json.loads(
+        sync_module._sanitize_json_environment(
+            json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": "https://private",
+                        "SAFE": "yes",
+                        "PASSWORD": "never",
+                    },
+                    "items": [{"cookie": "never", "enabled": True}],
+                    "args": ["server.js", "--api-key", "sk-secret"],
+                }
+            ).encode(),
+            strip_claude_routing=True,
+        )
+    )
+    assert cleaned == {
+        "args": [],
+        "env": {"SAFE": "yes"},
+        "items": [{"enabled": True}],
+    }
+    with pytest.raises(ValidationError, match="environment JSON"):
+        sync_module._sanitize_json_environment(b"not-json", strip_claude_routing=False)
+
+
+def test_project_environment_and_memory_apply_to_mapped_target(tmp_path: Path) -> None:
+    source_home = _home(tmp_path / "source-home")
+    source_project = tmp_path / "source-project"
+    source_project.mkdir()
+    (source_project / "AGENTS.md").write_text("source rules\n")
+    memory = (
+        source_home
+        / ".claude/projects"
+        / sync_module._claude_project_slug(source_project)
+        / "memory"
+    )
+    memory.mkdir(parents=True)
+    (memory / "MEMORY.md").write_text("learned\n")
+    manifest, sources = build_manifest(
+        source_home, ["project_env", "memory"], project_roots=(source_project,)
+    )
+    manifest, payload = materialize_sync_files(manifest, sources)
+
+    target_home = _home(tmp_path / "target-home")
+    target_project = tmp_path / "target-project"
+    target_project.mkdir()
+    project_id = manifest.project_ids[0]
+    apply_import(
+        target_home,
+        manifest,
+        payload,
+        environment_project_roots={project_id: target_project},
+    )
+
+    assert (target_project / "AGENTS.md").read_text() == "source rules\n"
+    target_memory = (
+        target_home
+        / ".claude/projects"
+        / sync_module._claude_project_slug(target_project)
+        / "memory/MEMORY.md"
+    )
+    assert target_memory.read_text() == "learned\n"
+    _, operation = _latest_operation(target_home)
+    assert operation.target_roots == {project_id: str(target_project)}
+    with pytest.raises(ValueError, match="project id"):
+        replace(operation, target_roots={"bad": str(target_project)})
+    with pytest.raises(ValueError, match="target must be absolute"):
+        replace(operation, target_roots={project_id: "relative"})
+
+    store = SnapshotStore(target_home / ".codelux")
+    recovery = replace(
+        operation,
+        files=tuple(replace(item, state=FileState.RECOVERY_REQUIRED) for item in operation.files),
+        state=OperationState.RECOVERY_REQUIRED,
+    )
+    store.write_manifest(recovery)
+    store.write_recovery(recovery)
+    store.recover(target_home, recovery.operation_id)
+    assert not (target_project / "AGENTS.md").exists()
+    assert not target_memory.exists()
+
+
+def test_local_project_mcp_is_sanitized_and_merged_for_target_path(tmp_path: Path) -> None:
+    source_home = _home(tmp_path / "source-home")
+    source_project = tmp_path / "source-project"
+    source_project.mkdir()
+    (source_project / "AGENTS.md").write_text("rules\n")
+    (source_home / ".claude.json").write_text(
+        json.dumps(
+            {
+                "oauthAccount": {"token": "never"},
+                "projects": {
+                    str(source_project): {
+                        "mcpServers": {
+                            "docs": {
+                                "command": "docs-server",
+                                "env": {"PUBLIC_MODE": "on", "ACCESS_TOKEN": "never"},
+                            }
+                        },
+                        "hasTrustDialogAccepted": True,
+                    }
+                },
+            }
+        )
+    )
+    manifest, sources = build_manifest(
+        source_home,
+        ["project_env", "local_env"],
+        project_roots=(source_project,),
+    )
+    manifest, payload = materialize_sync_files(manifest, sources)
+    assert set(json.loads(payload["project-local-mcp.json"])) == set(manifest.project_ids)
+    assert b"ACCESS_TOKEN" not in payload["project-local-mcp.json"]
+    assert b"oauthAccount" not in payload["project-local-mcp.json"]
+
+    target_home = _home(tmp_path / "target-home")
+    target_project = tmp_path / "target-project"
+    target_project.mkdir()
+    (target_home / ".claude.json").write_text(
+        json.dumps({"theme": "dark", "projects": {str(target_project): {"visits": 2}}})
+    )
+    project_id = manifest.project_ids[0]
+    apply_import(
+        target_home,
+        manifest,
+        payload,
+        environment_project_roots={project_id: target_project},
+    )
+    applied = json.loads((target_home / ".claude.json").read_text())
+    assert applied["theme"] == "dark"
+    assert applied["projects"][str(target_project)]["visits"] == 2
+    assert applied["projects"][str(target_project)]["mcpServers"] == {
+        "docs": {"command": "docs-server", "env": {"PUBLIC_MODE": "on"}}
+    }
+    baseline = next(iter(load_sync_state(target_home / ".codelux")["baselines"].values()))
+    assert (
+        baseline["files"]["project-local-mcp.json"]
+        == hashlib.sha256((target_home / ".claude.json").read_bytes()).hexdigest()
+    )
+
+    (target_home / ".claude.json").write_text(
+        json.dumps(
+            {"projects": {str(target_project): {"mcpServers": {"docs": {"command": "different"}}}}}
+        )
+    )
+    with pytest.raises(ValidationError, match="MCP conflict"):
+        apply_import(
+            target_home,
+            manifest,
+            payload,
+            environment_project_roots={project_id: target_project},
+        )
+    apply_import(
+        target_home,
+        manifest,
+        payload,
+        overwrite={"claude": True},
+        environment_project_roots={project_id: target_project},
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"not-json", b"[]", b'{"projects": []}'],
+)
+def test_invalid_claude_local_project_state_is_rejected(tmp_path: Path, payload: bytes) -> None:
+    home = _home(tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("rules\n")
+    (home / ".claude.json").write_bytes(payload)
+    with pytest.raises(ValidationError, match="local project configuration"):
+        build_manifest(
+            home,
+            ["project_env", "local_env"],
+            project_roots=(project,),
+        )
+
+
+def test_invalid_claude_local_mcp_shape_and_merge_targets_are_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "source.json"
+    project = tmp_path / "project"
+    project.mkdir()
+    project_id = sync_module._project_id(project)
+    source.write_text(json.dumps({"projects": {str(project): {"mcpServers": []}}}))
+    with pytest.raises(ValidationError, match="MCP configuration"):
+        sync_module._claude_local_mcp_content(source, {project_id: str(project)})
+    with pytest.raises(ValidationError, match="MCP mapping"):
+        sync_module._merge_claude_local_mcp(
+            tmp_path / "missing.json", b'{"unknown": {}}', {project_id: str(project)}, False
+        )
+
+    target = tmp_path / "target.json"
+    target.write_text('{"projects": []}')
+    with pytest.raises(ValidationError, match="local project configuration"):
+        sync_module._merge_claude_local_mcp(
+            target, json.dumps({project_id: {}}).encode(), {project_id: str(project)}, False
+        )
+
+
+def test_unrelated_project_symlink_is_ignored_but_selected_symlink_is_rejected(
+    tmp_path: Path,
+) -> None:
+    home = _home(tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("rules\n")
+    (project / "ordinary-link").symlink_to(project / "missing")
+    build_manifest(home, ["project_env"], project_roots=(project,))
+    (project / "AGENTS.md").unlink()
+    (project / "AGENTS.md").symlink_to(project / "missing")
+    with pytest.raises(ValidationError, match="symbolic link"):
+        build_manifest(home, ["project_env"], project_roots=(project,))
+
+
+def test_project_environment_requires_complete_safe_mapping(tmp_path: Path) -> None:
+    source_home = _home(tmp_path / "source-home")
+    source_project = tmp_path / "source-project"
+    source_project.mkdir()
+    (source_project / "AGENTS.md").write_text("rules\n")
+    manifest, sources = build_manifest(
+        source_home, ["project_env"], project_roots=(source_project,)
+    )
+    manifest, payload = materialize_sync_files(manifest, sources)
+    target_home = _home(tmp_path / "target-home")
+
+    with pytest.raises(ValidationError, match="requires a project root"):
+        build_manifest(source_home, ["project_env"])
+    with pytest.raises(ValidationError, match="requires project environment"):
+        build_manifest(source_home, ["local_env"], project_roots=(source_project,))
+
+    with pytest.raises(ValidationError, match="mapping is incomplete"):
+        apply_import(target_home, manifest, payload)
+    with pytest.raises(ValidationError, match="missing or unsafe"):
+        apply_import(
+            target_home,
+            manifest,
+            payload,
+            environment_project_roots={manifest.project_ids[0]: tmp_path / "missing"},
+        )
+
+
+def test_project_and_user_logical_targets_reject_missing_or_unsafe_mapping(
+    tmp_path: Path,
+) -> None:
+    project_id = "p-0123456789abcdef01234567"
+    with pytest.raises(ValidationError, match="environment mapping"):
+        sync_module._logical_target(tmp_path, f"project-env/{project_id}/AGENTS.md")
+    with pytest.raises(ValidationError, match="environment target"):
+        sync_module._logical_target(
+            tmp_path, f"project-env/{project_id}/AGENTS.md", {project_id: "relative"}
+        )
+    with pytest.raises(ValidationError, match="memory mapping"):
+        sync_module._logical_target(tmp_path, f"project-memory/{project_id}/MEMORY.md")
+    with pytest.raises(ValidationError, match="memory target"):
+        sync_module._logical_target(
+            tmp_path, f"project-memory/{project_id}/MEMORY.md", {project_id: "relative"}
+        )
+    with pytest.raises(ValidationError, match="user environment path"):
+        sync_module._logical_target(tmp_path, "user-env/claude/rules/")
 
 
 def test_select_claude_projects_keeps_only_requested_history(tmp_path: Path) -> None:
@@ -1216,9 +1613,22 @@ def test_transport_command_rejects_unsafe_target_or_arguments(target: str, args:
         ssh_command(target, args)
 
 
+class _FakeInput:
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, content: bytes) -> int:
+        self.data.extend(content)
+        return len(content)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class _FakePushProcess:
     def __init__(self, stdout: bytes, stderr: bytes = b"", code: int = 0) -> None:
-        self.stdin = io.BytesIO()
+        self.stdin = _FakeInput()
         self.stdout = io.BytesIO(stdout)
         self.stderr = io.BytesIO(stderr)
         self.code = code
@@ -1240,7 +1650,13 @@ def test_push_archive_negotiates_streams_and_confirms_commit(tmp_path: Path, mon
         canonical_line(capability.to_dict()) + b'{"status":"committed","operation":"op"}\n'
     )
     calls = []
-    monkeypatch.setattr(sync_transport.subprocess, "Popen", lambda *args, **kwargs: process)
+    commands = []
+
+    def fake_popen(command, **kwargs):
+        commands.append(command)
+        return process
+
+    monkeypatch.setattr(sync_transport.subprocess, "Popen", fake_popen)
 
     remote, response = push_archive(
         "root@example.com",
@@ -1249,6 +1665,7 @@ def test_push_archive_negotiates_streams_and_confirms_commit(tmp_path: Path, mon
         overwrite=True,
         claude_project_root="/workspace/example-project",
         progress=calls.append,
+        environment_project_roots={"p-0123456789abcdef01234567": tmp_path / "target"},
     )
 
     assert remote == capability
@@ -1258,6 +1675,11 @@ def test_push_archive_negotiates_streams_and_confirms_commit(tmp_path: Path, mon
         "Remote capability check passed; sending archive...",
         "Archive sent; waiting for target commit...",
     ]
+    assert "--project-map-stdin" in commands[0]
+    assert str(tmp_path / "target") not in " ".join(commands[0])
+    stream = io.BytesIO(bytes(process.stdin.data))
+    assert read_path_payload(stream) == {"p-0123456789abcdef01234567": str(tmp_path / "target")}
+    assert stream.read() == archive
 
 
 @pytest.mark.parametrize(
@@ -1327,6 +1749,15 @@ def test_transport_command_is_argument_safe() -> None:
     assert "shell=True" not in command
 
 
+def test_project_path_payload_reads_bounded_json_line() -> None:
+    payload = {"p-0123456789abcdef01234567": "/work/项目 name"}
+    assert read_path_payload(io.BytesIO(canonical_line(payload))) == payload
+    with pytest.raises(ValidationError, match="missing or too large"):
+        read_path_payload(io.BytesIO(b""))
+    with pytest.raises(ValidationError, match="payload is invalid"):
+        read_path_payload(io.BytesIO(b"not-json\n"))
+
+
 def test_pull_archive_uses_fixed_command_and_validates_stream(tmp_path: Path, monkeypatch) -> None:
     source = _home(tmp_path / "source")
     target = _home(tmp_path / "target")
@@ -1353,22 +1784,20 @@ def test_pull_archive_uses_fixed_command_and_validates_stream(tmp_path: Path, mo
 
     monkeypatch.setattr(sync_transport.subprocess, "run", fake_run)
     remote, restored, payload = pull_archive(
-        "root@example.com", target, ("providers",), True, clients=("claude",)
+        "root@example.com",
+        target,
+        ("providers",),
+        True,
+        clients=("claude",),
+        project_roots=(tmp_path / "remote project",),
     )
 
     assert remote == capability
     assert restored == manifest
     assert set(payload) == {"codelux/providers.json"}
-    assert calls[0][0][-8:] == [
-        "sync",
-        "transport",
-        "send",
-        "--protocol",
-        "1",
-        "--providers",
-        "--keys",
-        "--claude-sessions",
-    ]
+    assert "--project-roots-stdin" in calls[0][0]
+    assert str(tmp_path / "remote project") not in " ".join(calls[0][0])
+    assert json.loads(calls[0][1]["input"]) == [str(tmp_path / "remote project")]
     assert calls[0][1]["check"] is False
 
 

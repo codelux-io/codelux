@@ -222,7 +222,7 @@ class SnapshotStore:
             content = backup.read_bytes()
             if hashlib.sha256(content).hexdigest() != file.backup_sha256:
                 raise ValidationError("recovery backup hash mismatch")
-            target = _logical_target(home, file.source_path)
+            target = _logical_target(home, file.source_path, manifest.target_roots)
             if not file.source_existed:
                 if target.is_symlink():
                     raise ValidationError("recovery target is a symbolic link")
@@ -255,7 +255,14 @@ class SnapshotStore:
         return updated
 
 
-def _logical_target(home: Path, source_path: str) -> Path:
+def _claude_project_slug(project_root: Path) -> str:
+    resolved = project_root.expanduser().absolute()
+    return "-" + "-".join(part for part in resolved.parts if part not in ("/", ""))
+
+
+def _logical_target(
+    home: Path, source_path: str, project_roots: Optional[Mapping[str, str]] = None
+) -> Path:
     targets = {
         "claude/settings.json": home / ".claude" / "settings.json",
         "codex/config.toml": home / ".codex" / "config.toml",
@@ -266,6 +273,8 @@ def _logical_target(home: Path, source_path: str) -> Path:
     }
     if source_path in targets:
         return targets[source_path]
+    if source_path == "project-local-mcp.json":
+        return home / ".claude.json"
     if source_path.startswith("codex/sessions/"):
         relative = Path(source_path.removeprefix("codex/"))
         if relative.is_absolute() or ".." in relative.parts:
@@ -286,4 +295,59 @@ def _logical_target(home: Path, source_path: str) -> Path:
         except ValueError as exc:
             raise ValidationError("recovery session path escapes Claude root") from exc
         return target
+    if source_path.startswith("project-env/"):
+        parts = Path(source_path).parts
+        if len(parts) < 3 or project_roots is None or parts[1] not in project_roots:
+            raise ValidationError("project environment mapping is missing")
+        root = Path(project_roots[parts[1]])
+        if not root.is_absolute() or not root.is_dir() or root.is_symlink():
+            raise ValidationError("project environment target is missing or unsafe")
+        relative = Path(*parts[2:])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValidationError("project environment path escapes target root")
+        target = root / relative
+        try:
+            target.relative_to(root)
+        except ValueError as exc:
+            raise ValidationError("project environment path escapes target root") from exc
+        return target
+    if source_path.startswith("project-memory/"):
+        parts = Path(source_path).parts
+        if len(parts) < 3 or project_roots is None or parts[1] not in project_roots:
+            raise ValidationError("project memory mapping is missing")
+        root = Path(project_roots[parts[1]])
+        if not root.is_absolute() or not root.is_dir() or root.is_symlink():
+            raise ValidationError("project memory target is missing or unsafe")
+        relative = Path(*parts[2:])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValidationError("project memory path escapes target root")
+        memory_root = home / ".claude" / "projects" / _claude_project_slug(root) / "memory"
+        return memory_root / relative
+    user_targets = {
+        "user-env/codex/AGENTS.md": home / ".codex" / "AGENTS.md",
+        "user-env/codex/AGENTS.override.md": home / ".codex" / "AGENTS.override.md",
+        "user-env/codex/config.toml": home / ".codex" / "config.toml",
+        "user-env/claude/CLAUDE.md": home / ".claude" / "CLAUDE.md",
+        "user-env/claude/settings.json": home / ".claude" / "settings.json",
+    }
+    if source_path in user_targets:
+        return user_targets[source_path]
+    if source_path.startswith("user-env/codex/") and source_path.endswith(".config.toml"):
+        return home / ".codex" / Path(source_path).name
+    user_prefixes = {
+        "user-env/agents/skills/": home / ".agents" / "skills",
+        "user-env/claude/rules/": home / ".claude" / "rules",
+        "user-env/claude/skills/": home / ".claude" / "skills",
+        "user-env/claude/agents/": home / ".claude" / "agents",
+        "user-env/claude/commands/": home / ".claude" / "commands",
+        "user-env/claude/output-styles/": home / ".claude" / "output-styles",
+        "user-env/codex/rules/": home / ".codex" / "rules",
+        "user-env/codex/hooks/": home / ".codex" / "hooks",
+    }
+    for prefix, root in user_prefixes.items():
+        if source_path.startswith(prefix):
+            relative = Path(source_path.removeprefix(prefix))
+            if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+                raise ValidationError("user environment path escapes target root")
+            return root / relative
     raise ValidationError("recovery manifest contains an unknown source path")

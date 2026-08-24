@@ -5,7 +5,7 @@ Adapters and the transaction coordinator build on these stable contracts.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -122,6 +122,7 @@ class Manifest:
     registry_current: Mapping[str, Optional[str]]
     files: Tuple[ManifestFile, ...]
     state: OperationState = OperationState.PREPARED
+    target_roots: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -132,9 +133,14 @@ class Manifest:
             raise ValueError("manifest created_at must be an ISO-8601 timestamp") from exc
         if parsed.tzinfo is None:
             raise ValueError("manifest created_at must include a timezone")
+        for project_id, target_root in self.target_roots.items():
+            if not isinstance(project_id, str) or not project_id.startswith("p-"):
+                raise ValueError("manifest project id is invalid")
+            if not isinstance(target_root, str) or not Path(target_root).is_absolute():
+                raise ValueError("manifest project target must be absolute")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "operation_id": self.operation_id,
             "created_at": self.created_at,
@@ -158,6 +164,9 @@ class Manifest:
                 for f in self.files
             ],
         }
+        if self.target_roots:
+            payload["target_roots"] = dict(self.target_roots)
+        return payload
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "Manifest":
@@ -200,4 +209,5 @@ class Manifest:
             registry_current=dict(raw["registry_current"]),
             files=files,
             state=OperationState(raw["state"]),
+            target_roots={str(k): str(v) for k, v in raw.get("target_roots", {}).items()},
         )

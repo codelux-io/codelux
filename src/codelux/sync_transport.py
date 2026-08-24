@@ -14,6 +14,7 @@ from codelux.sync import (
     MAX_FILE,
     MAX_FILES,
     MAX_TOTAL,
+    SELECTIONS,
     SyncManifest,
     machine_id,
     parse_plain_archive,
@@ -97,7 +98,7 @@ def local_capability(home: Path) -> Capability:
     )
     return Capability(
         (1,),
-        ("config", "providers", "sessions"),
+        tuple(sorted(SELECTIONS)),
         installed,
         MAX_FILE,
         MAX_FILES,
@@ -108,7 +109,7 @@ def local_capability(home: Path) -> Capability:
     )
 
 
-def canonical_line(value: Mapping[str, Any]) -> bytes:
+def canonical_line(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
 
@@ -161,6 +162,16 @@ def ssh_command(target: str, remote_args: Sequence[str]) -> list[str]:
     return ["ssh", *SSH_OPTIONS, "--", target, "codelux", "sync", "transport", *remote_args]
 
 
+def read_path_payload(stream: Any) -> Any:
+    line = stream.readline(MAX_CAPABILITY_LINE + 1)
+    if not line or len(line) > MAX_CAPABILITY_LINE or not line.endswith(b"\n"):
+        raise ValidationError("project path payload is missing or too large")
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValidationError("project path payload is invalid") from exc
+
+
 def push_archive(
     target: str,
     manifest: SyncManifest,
@@ -169,6 +180,7 @@ def push_archive(
     claude_project_root: Optional[str] = None,
     progress: Optional[Callable[[str], None]] = None,
     overwrite_clients: Sequence[str] = (),
+    environment_project_roots: Optional[Mapping[str, Path]] = None,
 ) -> tuple[Capability, dict[str, Any]]:
     args = ["receive", "--protocol", "1"]
     if overwrite:
@@ -179,6 +191,15 @@ def push_archive(
         args.append(f"--overwrite-{client}")  # pragma: no cover - validated internal input
     if claude_project_root:
         args.extend(["--claude-project-root", claude_project_root])
+    mapping_payload = b""
+    if environment_project_roots:
+        args.append("--project-map-stdin")
+        mapping_payload = canonical_line(
+            {
+                key: str(path.expanduser().absolute())
+                for key, path in environment_project_roots.items()
+            }
+        )
     process = subprocess.Popen(
         ssh_command(target, args),
         stdin=subprocess.PIPE,
@@ -193,6 +214,7 @@ def push_archive(
         if progress:
             progress("Remote capability check passed; sending archive...")
         validate_capability(capability, manifest)
+        process.stdin.write(mapping_payload)
         process.stdin.write(archive)
         process.stdin.close()
         if progress:
@@ -225,23 +247,31 @@ def pull_archive(
     include_keys: bool,
     progress: Optional[Callable[[str], None]] = None,
     clients: Sequence[str] = (),
+    project_roots: Sequence[Path] = (),
 ) -> tuple[Capability, SyncManifest, dict[str, bytes]]:
     selected = tuple(sorted(set(selection)))
-    if not selected or set(selected).difference({"config", "providers", "sessions"}):
+    if not selected or set(selected).difference(SELECTIONS):
         raise ValidationError("at least one supported sync selection is required")
     args = ["send", "--protocol", "1"]
-    args.extend(f"--{name}" for name in selected)
+    args.extend(f"--{name.replace('_', '-')}" for name in selected)
     args.append("--keys" if include_keys else "--no-keys")
     for client in sorted(set(clients)):
         if client not in {"claude", "codex"}:  # pragma: no cover - validated internal input
             raise ValidationError("unsupported sync client")
         args.append(f"--{client}-sessions")
+    mapping_payload = None
+    if project_roots:
+        args.append("--project-roots-stdin")
+        mapping_payload = canonical_line(
+            [str(path.expanduser().absolute()) for path in project_roots]
+        )
     if progress:
         progress("Opening SSH connection and requesting archive...")
     process = subprocess.run(
         ssh_command(target, args),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        input=mapping_payload,
         check=False,
     )
     if process.returncode != 0:

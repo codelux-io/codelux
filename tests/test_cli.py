@@ -14,18 +14,35 @@ from codelux.cli import main
 from codelux.errors import ValidationError
 from codelux.models import ConfigState, ProcessState
 from codelux.snapshots import SnapshotStore
-from codelux.sync import _claude_project_slug, build_manifest, create_plain_archive, load_sync_state
+from codelux.sync import (
+    _claude_project_slug,
+    build_manifest,
+    create_plain_archive,
+    load_sync_state,
+    materialize_sync_files,
+)
 from codelux.sync_transport import local_capability, parse_plain_archive
 
 
 def test_sync_selection_splits_clients_and_overwrite_prompts(monkeypatch) -> None:
-    answers = iter([True, True, True, True])
+    answers = iter([True, True, True, True, True, True, True, True])
     monkeypatch.setattr(cli_module.click, "confirm", lambda *args, **kwargs: next(answers))
     selected, clients, _ = cli_module._push_selection(False, False)
-    assert selected == ("providers", "sessions")
+    assert selected == (
+        "providers",
+        "sessions",
+        "project_env",
+        "local_env",
+        "user_env",
+        "memory",
+    )
     assert clients == ("claude", "codex")
     assert cli_module._session_overwrite_prompts(clients, True) == clients
     assert cli_module._session_overwrite_prompts(("claude",), False) == ("claude",)
+    with pytest.raises(ValidationError, match="requires --project-env"):
+        cli_module._push_selection(False, False, local_env=True)
+    with pytest.raises(ValidationError, match="requires --project-env"):
+        cli_module._sync_selection(False, False, False, local_env=True)
 
 
 def test_codex_project_mapping_prompts_for_each_source_project(tmp_path: Path, monkeypatch) -> None:
@@ -50,6 +67,83 @@ def test_project_directory_requires_real_absolute_path(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
     assert cli_module._project_directory(project, local=True) == project
+
+
+def test_explicit_environment_project_mappings_are_identity_based(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source_one = tmp_path / "source-one"
+    source_two = tmp_path / "source-two"
+    target_one = tmp_path / "target-one"
+    target_two = tmp_path / "target-two"
+    for path in (source_one, source_two, target_one, target_two):
+        path.mkdir()
+
+    sources, mapping = cli_module._explicit_project_mappings(
+        (
+            f"{source_two}={target_two}",
+            f"{source_one}={target_one}",
+        ),
+        source_local=True,
+        target_local=True,
+    )
+    assert sources == (source_two, source_one)
+    assert mapping == {
+        cli_module._project_id(source_two): target_two,
+        cli_module._project_id(source_one): target_one,
+    }
+    assert (
+        cli_module._target_mapping_by_id(
+            tuple(sorted(mapping)),
+            tuple(f"{project_id}={mapping[project_id]}" for project_id in sorted(mapping)),
+        )
+        == mapping
+    )
+
+    with pytest.raises(ValidationError, match="distinct"):
+        cli_module._explicit_project_mappings(
+            (f"{source_one}={target_one}", f"{source_two}={target_one}"),
+            source_local=True,
+            target_local=True,
+        )
+    with pytest.raises(ValidationError, match="SOURCE=TARGET"):
+        cli_module._explicit_project_mappings(
+            (str(source_one),), source_local=True, target_local=True
+        )
+    with pytest.raises(ValidationError, match="absolute"):
+        cli_module._project_directory("relative", local=False)
+    with pytest.raises(ValidationError, match="does not exist"):
+        cli_module._project_directory(tmp_path / "missing", local=True)
+
+    project_ids = tuple(sorted(mapping))
+    manifest = type("Manifest", (), {"project_ids": project_ids})()
+    with pytest.raises(ValidationError, match="does not match"):
+        cli_module._environment_target_mapping(manifest, (source_one,), (target_one,))
+    one_manifest = type("Manifest", (), {"project_ids": (cli_module._project_id(source_one),)})()
+    with pytest.raises(ValidationError, match="requires one target"):
+        cli_module._environment_target_mapping(one_manifest, (source_one,), ())
+
+    with pytest.raises(ValidationError, match="PROJECT_ID=TARGET"):
+        cli_module._target_mapping_by_id(project_ids, (project_ids[0],))
+    with pytest.raises(ValidationError, match="unknown or duplicate"):
+        cli_module._target_mapping_by_id(project_ids, (f"p-{'f' * 24}={target_one}",))
+    with pytest.raises(ValidationError, match="distinct targets"):
+        cli_module._target_mapping_by_id(
+            project_ids,
+            (f"{project_ids[0]}={target_one}", f"{project_ids[1]}={target_one}"),
+        )
+    with pytest.raises(ValidationError, match="each project ID"):
+        cli_module._target_mapping_by_id(project_ids, (f"{project_ids[0]}={target_one}",))
+
+    monkeypatch.setattr(cli_module.click, "prompt", lambda *args, **kwargs: str(target_one))
+    assert cli_module._environment_project_roots((), local=True, prompt="Project") == (target_one,)
+    assert cli_module._environment_targets_for_sources((source_one,), (), local=True) == (
+        target_one,
+    )
+    with pytest.raises(ValidationError, match="requires one target"):
+        cli_module._environment_targets_for_sources(
+            (source_one,), (target_one, target_two), local=True
+        )
 
 
 def _claude_home(tmp_path: Path) -> Path:
@@ -579,6 +673,61 @@ def test_sync_import_maps_claude_history_from_real_paths(tmp_path: Path, monkeyp
     assert json.loads(mapped.read_text())["cwd"] == str(target_project)
 
 
+def test_sync_export_import_maps_project_environment_without_source_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source_home = _claude_home(tmp_path / "source-home")
+    target_home = _claude_home(tmp_path / "target-home")
+    for home in (source_home, target_home):
+        root = home / ".codelux"
+        root.mkdir()
+        (root / "providers.json").write_text(
+            json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+        )
+    source_project = tmp_path / "source-project"
+    target_project = tmp_path / "target-project"
+    source_project.mkdir()
+    target_project.mkdir()
+    (source_project / "AGENTS.md").write_text("portable rules\n")
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_installed", lambda self: False)
+    archive = tmp_path / "environment.cdlx"
+    runner = CliRunner()
+
+    exported = runner.invoke(
+        main,
+        [
+            "sync",
+            "export",
+            "--output",
+            str(archive),
+            "--project-env",
+            "--project-root",
+            str(source_project),
+            "--password-stdin",
+        ],
+        input="correct horse battery\n",
+        env={"CODELUX_TEST_HOME": str(source_home)},
+    )
+    assert exported.exit_code == 0, exported.output
+
+    imported = runner.invoke(
+        main,
+        [
+            "sync",
+            "import",
+            str(archive),
+            "--target-project-root",
+            str(target_project),
+            "--password-stdin",
+        ],
+        input="correct horse battery\n",
+        env={"CODELUX_TEST_HOME": str(target_home)},
+    )
+    assert imported.exit_code == 0, imported.output
+    assert (target_project / "AGENTS.md").read_text() == "portable rules\n"
+
+
 def test_sync_push_provider_success_and_registry_compensation(tmp_path: Path, monkeypatch) -> None:
     home = _claude_home(tmp_path)
     settings = home / ".claude/settings.json"
@@ -622,6 +771,115 @@ def test_sync_push_provider_success_and_registry_compensation(tmp_path: Path, mo
     )
     assert failed.exit_code != 0 and "injected push failure" in failed.output
     assert (root / "providers.json").read_bytes() == adopted
+
+
+def test_sync_push_transfers_mapped_project_environment(tmp_path: Path, monkeypatch) -> None:
+    home = _claude_home(tmp_path / "home")
+    root = home / ".codelux"
+    root.mkdir()
+    (root / "providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    project = tmp_path / "source-project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("rules\n")
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_installed", lambda self: False)
+    captured = {}
+
+    def succeed(
+        target,
+        manifest,
+        archive,
+        overwrite,
+        progress=None,
+        environment_project_roots=None,
+    ):
+        captured["manifest"] = manifest
+        captured["mapping"] = environment_project_roots
+        return local_capability(home), {"status": "committed"}
+
+    monkeypatch.setattr(cli_module, "push_archive", succeed)
+    result = CliRunner().invoke(
+        main,
+        [
+            "sync",
+            "push",
+            "--ssh",
+            "root@example.com",
+            "--project-env",
+            "--project-root",
+            str(project),
+            "--target-project-root",
+            "/target/project",
+        ],
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+
+    assert result.exit_code == 0, result.output
+    manifest = captured["manifest"]
+    project_id = manifest.project_ids[0]
+    assert manifest.selection == ("project_env",)
+    assert {item.path for item in manifest.files} == {f"project-env/{project_id}/AGENTS.md"}
+    assert captured["mapping"] == {project_id: Path("/target/project")}
+
+
+def test_sync_pull_applies_mapped_project_environment(tmp_path: Path, monkeypatch) -> None:
+    source_home = _claude_home(tmp_path / "source-home")
+    (source_home / ".codelux").mkdir()
+    source_project = tmp_path / "source-project"
+    source_project.mkdir()
+    (source_project / "CLAUDE.md").write_text("source instructions\n")
+    manifest, sources = build_manifest(
+        source_home, ["project_env"], project_roots=(source_project,)
+    )
+    manifest, payload = materialize_sync_files(manifest, sources)
+
+    target_home = _claude_home(tmp_path / "target-home")
+    target_root = target_home / ".codelux"
+    target_root.mkdir()
+    (target_root / "providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    target_project = tmp_path / "target-project"
+    target_project.mkdir()
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_installed", lambda self: False)
+    captured = {}
+
+    def receive(
+        target,
+        home,
+        selection,
+        include_keys,
+        progress=None,
+        clients=(),
+        project_roots=(),
+    ):
+        captured["project_roots"] = project_roots
+        return local_capability(source_home), manifest, payload
+
+    monkeypatch.setattr(cli_module, "pull_archive", receive)
+    result = CliRunner().invoke(
+        main,
+        [
+            "sync",
+            "pull",
+            "--ssh",
+            "root@example.com",
+            "--project-env",
+            "--project-root",
+            str(source_project),
+            "--target-project-root",
+            str(target_project),
+            "--overwrite",
+        ],
+        env={"CODELUX_TEST_HOME": str(target_home)},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["project_roots"] == (source_project,)
+    assert (target_project / "CLAUDE.md").read_text() == "source instructions\n"
 
 
 def test_sync_push_without_selection_prompts_for_contents(tmp_path: Path, monkeypatch) -> None:
