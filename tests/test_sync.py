@@ -2103,6 +2103,84 @@ def test_push_archive_falls_back_to_protocol_one_for_older_receiver(
     assert legacy_stream.read() == archive
 
 
+def test_preflight_rejects_invalid_sizes_and_frames(tmp_path: Path) -> None:
+    home = _home(tmp_path / "source")
+    manifest, _ = build_manifest(home, ["providers"], include_keys=True)
+
+    with pytest.raises(ValidationError, match="total size limit"):
+        sync_transport.preflight_payload(manifest, -1)
+    with pytest.raises(ValidationError, match="missing or too large"):
+        sync_transport.read_preflight_payload(io.BytesIO(b""))
+    with pytest.raises(ValidationError, match="payload is invalid"):
+        sync_transport.read_preflight_payload(io.BytesIO(b"{}\n"))
+
+    invalid = json.loads(sync_transport.preflight_payload(manifest, 0))
+    invalid["archive_size"] = True
+    with pytest.raises(ValidationError, match="payload is invalid"):
+        sync_transport.read_preflight_payload(io.BytesIO(canonical_line(invalid)))
+
+
+def test_receive_archive_stream_enforces_declared_size(tmp_path: Path) -> None:
+    home = _home(tmp_path / "source")
+    manifest, files = build_manifest(home, ["providers"], include_keys=True)
+    archive = create_plain_archive(manifest, files)
+
+    with pytest.raises(ValidationError, match="exceeds declared size"):
+        sync_transport.receive_archive_stream(io.BytesIO(archive), len(archive) - 1)
+    with pytest.raises(ValidationError, match="does not match preflight"):
+        sync_transport.receive_archive_stream(io.BytesIO(archive), len(archive) + 1)
+
+
+def test_archive_stream_helpers_reject_unsafe_streams_and_bound_errors() -> None:
+    class OversizedStream:
+        def seek(self, *args) -> None:
+            pass
+
+        def tell(self) -> int:
+            return sync_transport.MAX_ARCHIVE_SIZE + 1
+
+    class ErrorProcess:
+        def __init__(self, stderr) -> None:
+            self.stdin = _FakeInput()
+            self.stderr = stderr
+            self.killed = False
+            self.waited = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self) -> int:
+            self.waited = True
+            return 0
+
+    with pytest.raises(ValidationError, match="must be seekable"):
+        sync_transport._archive_size(object())
+    with pytest.raises(ValidationError, match="total size limit"):
+        sync_transport._archive_size(OversizedStream())
+    assert sync_transport._remote_stderr(ErrorProcess(None)) == ""
+    truncated = sync_transport._remote_stderr(
+        ErrorProcess(io.BytesIO(b"x" * (sync_transport.MAX_REMOTE_ERROR + 1)))
+    )
+    assert truncated.endswith("[remote error truncated]")
+
+    process = ErrorProcess(io.BytesIO())
+    progress = []
+    content = io.BytesIO(b"x" * (4 * sync_transport.ARCHIVE_CHUNK))
+    sync_transport._send_archive(
+        process,
+        content,
+        4 * sync_transport.ARCHIVE_CHUNK,
+        progress.append,
+    )
+    assert len(progress) == 4
+    assert process.stdin.closed
+
+    changed = ErrorProcess(io.BytesIO())
+    with pytest.raises(ValidationError, match="size changed"):
+        sync_transport._send_archive(changed, b"x", 2, None)
+    assert changed.killed and changed.waited
+
+
 def test_pull_archive_rejects_invalid_selection_before_starting_ssh(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="supported sync selection"):
         pull_archive("root@example.com", tmp_path, ("unknown",), True)
