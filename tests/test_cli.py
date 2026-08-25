@@ -122,6 +122,10 @@ def test_explicit_environment_project_mappings_are_identity_based(
     one_manifest = type("Manifest", (), {"project_ids": (cli_module._project_id(source_one),)})()
     with pytest.raises(ValidationError, match="requires one target"):
         cli_module._environment_target_mapping(one_manifest, (source_one,), ())
+    with pytest.raises(ValidationError, match="distinct targets"):
+        cli_module._environment_target_mapping(
+            manifest, (source_one, source_two), (target_one, target_one)
+        )
 
     with pytest.raises(ValidationError, match="PROJECT_ID=TARGET"):
         cli_module._target_mapping_by_id(project_ids, (project_ids[0],))
@@ -135,7 +139,8 @@ def test_explicit_environment_project_mappings_are_identity_based(
     with pytest.raises(ValidationError, match="each project ID"):
         cli_module._target_mapping_by_id(project_ids, (f"{project_ids[0]}={target_one}",))
 
-    monkeypatch.setattr(cli_module.click, "prompt", lambda *args, **kwargs: str(target_one))
+    prompt_answers = iter([str(target_one), "", str(target_one)])
+    monkeypatch.setattr(cli_module.click, "prompt", lambda *args, **kwargs: next(prompt_answers))
     assert cli_module._environment_project_roots((), local=True, prompt="Project") == (target_one,)
     assert cli_module._environment_targets_for_sources((source_one,), (), local=True) == (
         target_one,
@@ -824,6 +829,60 @@ def test_sync_push_transfers_mapped_project_environment(tmp_path: Path, monkeypa
     assert captured["mapping"] == {project_id: Path("/target/project")}
 
 
+def test_sync_push_guides_multiple_project_environment_mappings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = _claude_home(tmp_path / "home")
+    root = home / ".codelux"
+    root.mkdir()
+    (root / "providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    projects = (tmp_path / "source-one", tmp_path / "source-two")
+    for index, project in enumerate(projects, 1):
+        project.mkdir()
+        (project / "AGENTS.md").write_text(f"project {index}\n")
+    history = home / ".claude/projects/example"
+    history.mkdir(parents=True)
+    for index, project in enumerate(projects, 1):
+        (history / f"session-{index}.jsonl").write_text(json.dumps({"cwd": str(project)}) + "\n")
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_installed", lambda self: False)
+    captured = {}
+
+    def succeed(
+        target,
+        manifest,
+        archive,
+        overwrite,
+        progress=None,
+        environment_project_roots=None,
+    ):
+        captured["manifest"] = manifest
+        captured["mapping"] = environment_project_roots
+        return local_capability(home), {"status": "committed"}
+
+    monkeypatch.setattr(cli_module, "push_archive", succeed)
+    result = CliRunner().invoke(
+        main,
+        ["sync", "push", "--ssh", "root@example.com", "--project-env"],
+        input="y\ny\n\n/target/project-one\n/target/project-two\n",
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+
+    assert result.exit_code == 0, result.output
+    manifest = captured["manifest"]
+    expected_mapping = {
+        cli_module._project_id(projects[0]): Path("/target/project-one"),
+        cli_module._project_id(projects[1]): Path("/target/project-two"),
+    }
+    assert set(manifest.project_ids) == set(expected_mapping)
+    assert captured["mapping"] == expected_mapping
+    assert f"Include suggested source project 1: {projects[0]}? [y/N]:" in result.output
+    assert f"Include suggested source project 2: {projects[1]}? [y/N]:" in result.output
+    assert "Additional source project directory (leave empty to finish):" in result.output
+
+
 def test_sync_pull_applies_mapped_project_environment(tmp_path: Path, monkeypatch) -> None:
     source_home = _claude_home(tmp_path / "source-home")
     (source_home / ".codelux").mkdir()
@@ -860,6 +919,13 @@ def test_sync_pull_applies_mapped_project_environment(tmp_path: Path, monkeypatc
         return local_capability(source_home), manifest, payload
 
     monkeypatch.setattr(cli_module, "pull_archive", receive)
+    monkeypatch.setattr(
+        cli_module,
+        "discover_remote_project_candidates",
+        lambda target: (_ for _ in ()).throw(
+            AssertionError("explicit project roots must skip remote discovery")
+        ),
+    )
     result = CliRunner().invoke(
         main,
         [
@@ -880,6 +946,118 @@ def test_sync_pull_applies_mapped_project_environment(tmp_path: Path, monkeypatc
     assert result.exit_code == 0, result.output
     assert captured["project_roots"] == (source_project,)
     assert (target_project / "CLAUDE.md").read_text() == "source instructions\n"
+
+
+def test_sync_pull_guides_multiple_project_environment_mappings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source_home = _claude_home(tmp_path / "source-home")
+    (source_home / ".codelux").mkdir()
+    source_projects = (tmp_path / "source-one", tmp_path / "source-two")
+    for index, project in enumerate(source_projects, 1):
+        project.mkdir()
+        (project / "CLAUDE.md").write_text(f"source {index}\n")
+    manifest, sources = build_manifest(source_home, ["project_env"], project_roots=source_projects)
+    manifest, payload = materialize_sync_files(manifest, sources)
+
+    target_home = _claude_home(tmp_path / "target-home")
+    target_root = target_home / ".codelux"
+    target_root.mkdir()
+    (target_root / "providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    target_projects = (tmp_path / "target-one", tmp_path / "target-two")
+    for project in target_projects:
+        project.mkdir()
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_installed", lambda self: False)
+    captured = {}
+
+    def receive(
+        target,
+        home,
+        selection,
+        include_keys,
+        progress=None,
+        clients=(),
+        project_roots=(),
+    ):
+        captured["project_roots"] = project_roots
+        return local_capability(source_home), manifest, payload
+
+    monkeypatch.setattr(cli_module, "pull_archive", receive)
+    monkeypatch.setattr(
+        cli_module, "discover_remote_project_candidates", lambda target: source_projects
+    )
+    result = CliRunner().invoke(
+        main,
+        ["sync", "pull", "--ssh", "root@example.com", "--project-env", "--overwrite"],
+        input=f"y\ny\n\n{target_projects[0]}\n{target_projects[1]}\n",
+        env={"CODELUX_TEST_HOME": str(target_home)},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["project_roots"] == source_projects
+    assert f"Include suggested source project 1: {source_projects[0]}? [y/N]:" in result.output
+    assert f"Include suggested source project 2: {source_projects[1]}? [y/N]:" in result.output
+    assert (target_projects[0] / "CLAUDE.md").read_text() == "source 1\n"
+    assert (target_projects[1] / "CLAUDE.md").read_text() == "source 2\n"
+
+
+def test_sync_pull_falls_back_to_manual_paths_when_remote_discovery_is_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = _claude_home(tmp_path / "home")
+    root = home / ".codelux"
+    root.mkdir()
+    (root / "providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_installed", lambda self: False)
+    monkeypatch.setattr(
+        cli_module,
+        "discover_remote_project_candidates",
+        lambda target: (_ for _ in ()).throw(
+            sync_transport.RemoteProjectDiscoveryUnavailable("older remote")
+        ),
+    )
+    captured = {}
+
+    def roots(values, *, local, prompt, default_cwd=False, candidates=()):
+        captured["candidates"] = candidates
+        raise ValidationError("stop after fallback")
+
+    monkeypatch.setattr(cli_module, "_environment_project_roots", roots)
+    result = CliRunner().invoke(
+        main,
+        ["sync", "pull", "--ssh", "root@example.com", "--project-env"],
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+
+    assert result.exit_code != 0
+    assert (
+        "Remote project suggestions unavailable (older remote); enter paths manually."
+        in result.output
+    )
+    assert "stop after fallback" in result.output
+    assert captured["candidates"] == ()
+
+    captured.clear()
+    monkeypatch.setattr(
+        cli_module,
+        "discover_remote_project_candidates",
+        lambda target: (_ for _ in ()).throw(ValidationError("malformed response")),
+    )
+    invalid = CliRunner().invoke(
+        main,
+        ["sync", "pull", "--ssh", "root@example.com", "--project-env"],
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+    assert invalid.exit_code != 0
+    assert "malformed response" in invalid.output
+    assert "suggestions unavailable" not in invalid.output
+    assert captured == {}
 
 
 def test_sync_push_without_selection_prompts_for_contents(tmp_path: Path, monkeypatch) -> None:
@@ -907,13 +1085,141 @@ def test_sync_push_without_selection_prompts_for_contents(tmp_path: Path, monkey
     )
 
     assert result.exit_code == 0, result.output
-    assert "Select content to synchronize:" not in result.output
-    assert "Synchronize third-party Providers and API keys? [Y/n]:" in result.output
-    assert "Synchronize Claude Code project history? [y/N]:" in result.output
-    assert "Synchronize Codex session history? [y/N]:" in result.output
-    assert "Synchronize the active Provider configuration?" not in result.output
+    assert "Select content to synchronize. Answer each question separately." in result.output
+    assert "Press Enter to accept the capitalized default" in result.output
+    assert "Providers: third-party endpoints and API keys" in result.output
+    assert "(official account logins excluded)? [Y/n]:" in result.output
+    assert "Claude Code history: project conversation records? [y/N]:" in result.output
+    assert "Codex history: sessions and local session index? [y/N]:" in result.output
     assert captured["target"] == "root@example.com"
     assert captured["manifest"].selection == ("providers",)
+
+
+def test_project_root_prompt_does_not_default_to_user_home(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("CODELUX_TEST_HOME", str(home))
+    monkeypatch.chdir(home)
+    prompts = []
+
+    answers = iter([str(project), ""])
+
+    def prompt(message, **kwargs):
+        prompts.append((message, kwargs))
+        return next(answers)
+
+    monkeypatch.setattr(cli_module.click, "prompt", prompt)
+
+    assert cli_module._environment_project_roots(
+        (), local=True, prompt="Source project directory", default_cwd=True
+    ) == (project,)
+    assert prompts == [
+        (
+            "Source project directory 1",
+            {"default": "", "show_default": False},
+        ),
+        (
+            "Additional source project directory (leave empty to finish)",
+            {"default": "", "show_default": False},
+        ),
+    ]
+
+    prompts.clear()
+    monkeypatch.chdir(project)
+    answers = iter([str(project), ""])
+    assert cli_module._environment_project_roots(
+        (), local=True, prompt="Source project directory", default_cwd=True
+    ) == (project,)
+    assert prompts == [
+        (
+            "Source project directory 1",
+            {"default": str(project), "show_default": True},
+        ),
+        (
+            "Additional source project directory (leave empty to finish)",
+            {"default": "", "show_default": False},
+        ),
+    ]
+
+
+def test_project_root_prompt_collects_multiple_distinct_projects(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    projects = (tmp_path / "one", tmp_path / "two")
+    for project in projects:
+        project.mkdir()
+    monkeypatch.setenv("CODELUX_TEST_HOME", str(home))
+    monkeypatch.chdir(home)
+    answers = iter([str(projects[0]), str(projects[1]), ""])
+    monkeypatch.setattr(cli_module.click, "prompt", lambda *args, **kwargs: next(answers))
+
+    assert (
+        cli_module._environment_project_roots(
+            (), local=True, prompt="Source project directory", default_cwd=True
+        )
+        == projects
+    )
+
+
+def test_project_root_prompt_retries_empty_first_value_and_rejects_duplicates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("CODELUX_TEST_HOME", str(home))
+    monkeypatch.chdir(home)
+    answers = iter(["", str(project), ""])
+    monkeypatch.setattr(cli_module.click, "prompt", lambda *args, **kwargs: next(answers))
+
+    assert cli_module._environment_project_roots(
+        (), local=True, prompt="Source project directory", default_cwd=True
+    ) == (project,)
+
+    duplicate_answers = iter([str(project), str(project)])
+    monkeypatch.setattr(cli_module.click, "prompt", lambda *args, **kwargs: next(duplicate_answers))
+    with pytest.raises(ValidationError, match="must be distinct"):
+        cli_module._environment_project_roots(
+            (), local=True, prompt="Source project directory", default_cwd=True
+        )
+
+
+def test_project_root_prompt_confirms_session_history_candidates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    candidates = (tmp_path / "one", tmp_path / "two")
+    for candidate in candidates:
+        candidate.mkdir()
+    monkeypatch.setenv("CODELUX_TEST_HOME", str(home))
+    monkeypatch.chdir(home)
+    confirmations = iter([True, False])
+    questions = []
+
+    def confirm(question, **kwargs):
+        questions.append((question, kwargs))
+        return next(confirmations)
+
+    monkeypatch.setattr(cli_module.click, "confirm", confirm)
+    monkeypatch.setattr(cli_module.click, "prompt", lambda *args, **kwargs: "")
+
+    assert cli_module._environment_project_roots(
+        (),
+        local=True,
+        prompt="Source project directory",
+        default_cwd=True,
+        candidates=candidates,
+    ) == (candidates[0],)
+    assert questions == [
+        (f"Include suggested source project 1: {candidates[0]}?", {"default": False}),
+        (f"Include suggested source project 2: {candidates[1]}?", {"default": False}),
+    ]
 
 
 def test_sync_push_without_selection_can_cancel_all_content(tmp_path: Path, monkeypatch) -> None:
@@ -1124,8 +1430,33 @@ def test_sync_transport_endpoints_reject_wrong_protocol(tmp_path: Path) -> None:
         ["sync", "transport", "send", "--protocol", "2", "--providers"],
         env=env,
     )
+    discovered = runner.invoke(
+        main, ["sync", "transport", "discover-projects", "--protocol", "2"], env=env
+    )
     assert received.exit_code != 0 and "unsupported sync protocol" in received.output
     assert sent.exit_code != 0 and "unsupported sync protocol" in sent.output
+    assert discovered.exit_code != 0 and "unsupported sync protocol" in discovered.output
+
+
+def test_sync_transport_discover_projects_outputs_safe_candidates(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = _claude_home(tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+    history = home / ".claude/projects/example"
+    history.mkdir(parents=True)
+    (history / "session.jsonl").write_text(json.dumps({"cwd": str(project)}) + "\n")
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+
+    result = CliRunner().invoke(
+        main,
+        ["sync", "transport", "discover-projects", "--protocol", "1"],
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout_bytes) == [str(project)]
 
 
 def test_sync_pull_applies_remote_provider_archive(tmp_path: Path, monkeypatch) -> None:

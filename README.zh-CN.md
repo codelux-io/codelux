@@ -135,12 +135,27 @@ codelux sync push --ssh user@host.example \
   --project-map /work/my-project=/srv/my-project
 ```
 
+未提供内容范围参数时，`sync push` 和 `sync pull` 会显示引导式清单，逐项解释同步范围，并用
+`[Y/n]` 或 `[y/N]` 标出默认选项；直接回车会接受其中的大写选项。同步项目环境或项目记忆时，
+请逐个输入每个源项目根目录，在下一个源目录提示处留空即可结束列表。Codelux 会为每个源项目
+分别询问目标项目根目录。对于 `sync push` 这类源数据位于本机的操作，Codelux 会先从 Claude
+Code 和 Codex 会话历史中发现仍然存在的项目根目录，在独立的 `[y/N]` 提示行中逐个询问是否
+同步，然后允许继续补充未被建议的目录。补充输入行会明确显示
+`Additional source project directory (leave empty to finish)`；已经选择至少一个项目后，直接
+回车即可结束列表。`sync pull` 会先通过独立的只读 SSH 命令从远端会话历史发现候选目录，在
+本机逐项确认后，再在请求正式归档时把所选根目录发回远端。如果远端版本尚不支持候选查询，
+Codelux 会明确提示候选不可用，并回退到手工输入远端路径。命令可以从任意目录运行，也可以在
+一次传输中同步多个项目。需要确认绝对路径时，可以进入相应项目执行 `pwd`。只有第一个手工
+本地源项目、且当前目录不属于用户主目录时，Codelux 才会建议当前目录作为快捷默认值，避免
+误扫整个主目录。有效项目树中的 Unix socket、FIFO 和设备节点不属于可移植文件，会被忽略；
+符号链接仍会被拒绝。
+
 共享项目白名单包括分层 `AGENTS.md`、`AGENTS.override.md`、`CLAUDE.md`、项目内 Claude
 导入文件、`.mcp.json`、选定的 Claude settings/rules/skills/agents/commands，以及选定的
 Codex 配置/rules/hooks。`CLAUDE.local.md`、`.claude/settings.local.json` 等仅本地文件必须
-显式使用 `--local-project-env`。同步多个项目时，重复提供 `--project-map SOURCE=TARGET`；
-映射是显式的，不依赖参数顺序。离线导入只暴露不透明项目 ID，并使用
-`--target-project PROJECT_ID=TARGET` 指定目标。
+显式使用 `--local-project-env`。非交互式同步多个项目时，重复提供
+`--project-map SOURCE=TARGET`；映射是显式的，不依赖参数顺序。离线导入只暴露不透明项目
+ID，并使用 `--target-project PROJECT_ID=TARGET` 指定目标。
 
 认证数据库、OAuth/账号状态、Provider 路由、Codex trust 和用户级 Codex MCP server 表
 不会同步。JSON 中疑似秘密的字段会被移除；如果 MCP command 参数数组包含凭据参数名或

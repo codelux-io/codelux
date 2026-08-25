@@ -30,10 +30,12 @@ from codelux.sync import (
     save_baseline,
     select_claude_projects,
     select_codex_projects,
+    session_project_candidates,
 )
 from codelux.sync_transport import (
     Capability,
     canonical_line,
+    discover_remote_project_candidates,
     local_capability,
     parse_plain_archive,
     pull_archive,
@@ -254,6 +256,32 @@ def test_sessions_ignore_regular_metadata_files(tmp_path: Path) -> None:
     assert [item.path for item in manifest.files] == ["claude/projects/example/session.jsonl"]
 
 
+def test_session_project_candidates_merge_existing_claude_and_codex_roots(tmp_path: Path) -> None:
+    home = _home(tmp_path / "home")
+    claude_project = tmp_path / "claude-project"
+    codex_project = tmp_path / "codex-project"
+    claude_project.mkdir()
+    codex_project.mkdir()
+    history = home / ".claude/projects/example"
+    history.mkdir(parents=True)
+    (history / "session.jsonl").write_text(
+        "not-json\n" + json.dumps({"cwd": str(claude_project)}) + "\n"
+    )
+    with sqlite3.connect(home / ".codex/state_5.sqlite") as connection:
+        connection.execute("CREATE TABLE threads (cwd TEXT, model_provider TEXT)")
+        connection.executemany(
+            "INSERT INTO threads VALUES (?, ?)",
+            [
+                (str(codex_project), "custom"),
+                (str(claude_project), "custom"),
+                (str(home), "custom"),
+                (str(tmp_path / "missing"), "custom"),
+            ],
+        )
+
+    assert session_project_candidates(home) == tuple(sorted((claude_project, codex_project)))
+
+
 def test_project_environment_collects_agent_files_and_requires_local_opt_in(
     tmp_path: Path,
 ) -> None:
@@ -310,6 +338,17 @@ def test_project_environment_collects_agent_files_and_requires_local_opt_in(
     local, _ = build_manifest(home, ["project_env", "local_env"], project_roots=(project,))
     local_paths = {item.path.split("/", 2)[2] for item in local.files}
     assert {"CLAUDE.local.md", ".claude/settings.local.json"}.issubset(local_paths)
+
+
+def test_project_environment_ignores_non_regular_files(tmp_path: Path) -> None:
+    home = _home(tmp_path / "home")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "AGENTS.md").write_text("portable instructions\n")
+    os.mkfifo(project / "runtime.pipe")
+    manifest, _ = build_manifest(home, ["project_env"], project_roots=(project,))
+
+    assert [item.path.split("/", 2)[2] for item in manifest.files] == ["AGENTS.md"]
 
 
 def test_user_environment_excludes_authentication_and_collects_extensions(tmp_path: Path) -> None:
@@ -1756,6 +1795,53 @@ def test_project_path_payload_reads_bounded_json_line() -> None:
         read_path_payload(io.BytesIO(b""))
     with pytest.raises(ValidationError, match="payload is invalid"):
         read_path_payload(io.BytesIO(b"not-json\n"))
+
+
+def test_remote_project_discovery_uses_fixed_command_and_validates_paths(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command, 0, canonical_line(["/remote/project-one", "/remote/project-two"]), b""
+        )
+
+    monkeypatch.setattr(sync_transport.subprocess, "run", fake_run)
+    assert discover_remote_project_candidates("root@example.com") == (
+        Path("/remote/project-one"),
+        Path("/remote/project-two"),
+    )
+    assert calls[0][0][-3:] == ["discover-projects", "--protocol", "1"]
+    assert calls[0][1]["check"] is False
+
+    invalid = (
+        canonical_line(["relative/project"]),
+        canonical_line(["/remote/project", "/remote/project"]),
+        canonical_line({"path": "/remote/project"}),
+        canonical_line(["/remote/project"]) + b"extra",
+    )
+    for output in invalid:
+        monkeypatch.setattr(
+            sync_transport.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, output, b""),
+        )
+        with pytest.raises(ValidationError, match="discovery response"):
+            discover_remote_project_candidates("root@example.com")
+
+
+def test_remote_project_discovery_reports_ssh_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sync_transport.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 255, b"", b"remote command unavailable"
+        ),
+    )
+    with pytest.raises(ValidationError, match="remote command unavailable"):
+        discover_remote_project_candidates("root@example.com")
 
 
 def test_pull_archive_uses_fixed_command_and_validates_stream(tmp_path: Path, monkeypatch) -> None:

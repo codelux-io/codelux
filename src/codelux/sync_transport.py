@@ -31,6 +31,10 @@ SSH_OPTIONS = (
 )
 
 
+class RemoteProjectDiscoveryUnavailable(ValidationError):
+    """Raised when the remote cannot execute the optional discovery command."""
+
+
 @dataclass(frozen=True)
 class Capability:
     protocol_versions: tuple[int, ...]
@@ -170,6 +174,37 @@ def read_path_payload(stream: Any) -> Any:
         return json.loads(line)
     except json.JSONDecodeError as exc:
         raise ValidationError("project path payload is invalid") from exc
+
+
+def discover_remote_project_candidates(target: str) -> tuple[Path, ...]:
+    process = subprocess.run(
+        ssh_command(target, ["discover-projects", "--protocol", "1"]),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if process.returncode != 0:
+        stderr = process.stderr.decode(errors="replace").strip()
+        raise RemoteProjectDiscoveryUnavailable(
+            "remote project discovery failed" + (": " + stderr if stderr else "")
+        )
+    stream = io.BytesIO(process.stdout)
+    decoded = read_path_payload(stream)
+    if stream.read() or not isinstance(decoded, list):
+        raise ValidationError("remote project discovery response is invalid")
+    candidates = []
+    for value in decoded:
+        if (
+            not isinstance(value, str)
+            or not value
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValidationError("remote project discovery response is invalid")
+        path = Path(value)
+        if not path.is_absolute() or path in candidates:
+            raise ValidationError("remote project discovery response is invalid")
+        candidates.append(path)
+    return tuple(candidates)
 
 
 def push_archive(

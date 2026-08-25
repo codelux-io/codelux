@@ -5,7 +5,7 @@ import os
 import sys
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Optional, TypedDict, TypeVar
+from typing import Any, Callable, Optional, Sequence, TypedDict, TypeVar
 
 import click
 
@@ -49,9 +49,12 @@ from codelux.sync import (
     select_claude_project,
     select_claude_projects,
     select_codex_projects,
+    session_project_candidates,
 )
 from codelux.sync_transport import (
+    RemoteProjectDiscoveryUnavailable,
     canonical_line,
+    discover_remote_project_candidates,
     local_capability,
     parse_plain_archive,
     pull_archive,
@@ -120,13 +123,55 @@ def _sync_selection(
 
 
 def _environment_project_roots(
-    values: tuple[Path, ...], *, local: bool, prompt: str, default_cwd: bool = False
+    values: tuple[Path, ...],
+    *,
+    local: bool,
+    prompt: str,
+    default_cwd: bool = False,
+    candidates: Sequence[Path] = (),
 ) -> tuple[Path, ...]:
     if values:
         return tuple(_project_directory(value, local=local) for value in values)
-    default = str(Path.cwd()) if default_cwd else ""
-    value = click.prompt(prompt, default=default, show_default=default_cwd)
-    return (_project_directory(value, local=local),)
+    cwd = Path.cwd()
+    use_cwd_default = default_cwd and cwd != _home()
+    click.echo("Enter one project root at a time; leave the next prompt empty when finished.")
+    if default_cwd and not use_cwd_default:
+        click.echo(
+            "Enter the specific project root, not your user home. "
+            "Run pwd inside the project and paste that absolute path."
+        )
+    roots: list[Path] = []
+    if candidates:
+        click.echo("Suggested source projects discovered from session history:")
+        for index, candidate in enumerate(candidates, 1):
+            if _safe_confirm(
+                f"Include suggested source project {index}: {candidate}?", default=False
+            ):
+                roots.append(candidate)
+    while True:
+        first = not roots
+        default = str(cwd) if first and use_cwd_default else ""
+        manual_prompt = (
+            f"{prompt} 1"
+            if first
+            else "Additional source project directory (leave empty to finish)"
+        )
+        value = str(
+            click.prompt(
+                manual_prompt,
+                default=default,
+                show_default=bool(default),
+            )
+        ).strip()
+        if not value:
+            if roots:
+                return tuple(roots)
+            click.echo("At least one project root is required.")
+            continue
+        root = _project_directory(value, local=local)
+        if root in roots:
+            raise ValidationError("source project directories must be distinct")
+        roots.append(root)
 
 
 def _environment_target_mapping(
@@ -137,6 +182,8 @@ def _environment_target_mapping(
         raise ValidationError("project environment source mapping does not match the archive")
     if len(source_roots) != len(target_roots):
         raise ValidationError("each source project requires one target project directory")
+    if len(set(target_roots)) != len(target_roots):
+        raise ValidationError("project mappings must use distinct targets")
     return dict(zip(project_ids, target_roots))
 
 
@@ -274,7 +321,11 @@ def sync_export(
         )
         roots = (
             _environment_project_roots(
-                project_root, local=True, prompt="Source project directory", default_cwd=True
+                project_root,
+                local=True,
+                prompt="Source project directory",
+                default_cwd=True,
+                candidates=session_project_candidates(_home()),
             )
             if set(selected).intersection({"project_env", "local_env", "memory"})
             else ()
@@ -308,17 +359,33 @@ def _push_selection(
     explicit = providers or bool(requested_clients) or project_env or user_env or memory
     prompted = []
     if not explicit:
-        if _safe_confirm("Synchronize third-party Providers and API keys?", default=True):
+        click.echo("Select content to synchronize. Answer each question separately.")
+        click.echo("Press Enter to accept the capitalized default shown in [Y/n] or [y/N].")
+        if _safe_confirm(
+            "Providers: third-party endpoints and API keys " "(official account logins excluded)?",
+            default=True,
+        ):
             providers = True
-        if _safe_confirm("Synchronize Claude Code project history?", default=False):
+        if _safe_confirm("Claude Code history: project conversation records?", default=False):
             requested_clients.append("claude")
-        if _safe_confirm("Synchronize Codex session history?", default=False):
+        if _safe_confirm("Codex history: sessions and local session index?", default=False):
             requested_clients.append("codex")
-        project_env = _safe_confirm("Synchronize shared project agent environment?", default=False)
+        project_env = _safe_confirm(
+            "Shared project environment: portable instructions, rules, skills, and hooks?",
+            default=False,
+        )
         if project_env:
-            local_env = _safe_confirm("Include local project overrides?", default=False)
-        user_env = _safe_confirm("Synchronize user-level agent environment?", default=False)
-        memory = _safe_confirm("Synchronize project memory?", default=False)
+            local_env = _safe_confirm(
+                "Local project overrides: machine-specific project settings too?", default=False
+            )
+        user_env = _safe_confirm(
+            "User environment: user-level instructions, rules, skills, and hooks "
+            "(authentication excluded)?",
+            default=False,
+        )
+        memory = _safe_confirm(
+            "Claude project memory: Markdown memory files for this project?", default=False
+        )
     if providers:
         prompted.append("providers")
     if requested_clients:
@@ -662,9 +729,13 @@ def sync_push(
             )
         elif environment_selected:
             environment_source_roots = _environment_project_roots(
-                project_root, local=True, prompt="Source project directory", default_cwd=True
+                project_root,
+                local=True,
+                prompt="Source project directory",
+                default_cwd=True,
+                candidates=session_project_candidates(_home()),
             )
-            if len(environment_source_roots) > 1 or len(target_project_root) > 1:
+            if len(project_root) > 1 or len(target_project_root) > 1:
                 raise ValidationError("multiple projects require --project-map SOURCE=TARGET")
         else:
             environment_source_roots = ()
@@ -874,10 +945,21 @@ def sync_pull(
                 project_map, source_local=False, target_local=True
             )
         elif environment_selected:
+            remote_candidates: tuple[Path, ...] = ()
+            if not project_root:
+                try:
+                    remote_candidates = discover_remote_project_candidates(target)
+                except RemoteProjectDiscoveryUnavailable as exc:
+                    click.echo(
+                        f"Remote project suggestions unavailable ({exc}); " "enter paths manually."
+                    )
             requested_environment_roots = _environment_project_roots(
-                project_root, local=False, prompt="Source project directory on remote machine"
+                project_root,
+                local=False,
+                prompt="Source project directory on remote machine",
+                candidates=remote_candidates,
             )
-            if len(requested_environment_roots) > 1 or len(target_project_root) > 1:
+            if len(project_root) > 1 or len(target_project_root) > 1:
                 raise ValidationError("multiple projects require --project-map SOURCE=TARGET")
         else:
             requested_environment_roots = ()
@@ -1181,6 +1263,22 @@ def sync_transport_receive(
                 {"status": "committed", "transfer_id": manifest.transfer_id, "missing": missing}
             )
         )
+    except CodeluxError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@sync_transport_group.command(name="discover-projects")
+@click.option("--protocol", type=int, required=True)
+def sync_transport_discover_projects(protocol: int) -> None:
+    """Return safe project roots referenced by local session history."""
+    try:
+        if protocol != 1:
+            raise ValidationError("unsupported sync protocol")
+        _sync_process_preflight(("sessions",))
+        sys.stdout.buffer.write(
+            canonical_line([str(path) for path in session_project_candidates(_home())])
+        )
+        sys.stdout.buffer.flush()
     except CodeluxError as exc:
         raise click.ClickException(str(exc)) from exc
 

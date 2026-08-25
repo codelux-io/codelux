@@ -138,12 +138,31 @@ codelux sync push --ssh user@host.example \
   --project-map /work/my-project=/srv/my-project
 ```
 
+Without content flags, `sync push` and `sync pull` present a guided checklist that describes each
+scope and shows its default as `[Y/n]` or `[y/N]`; pressing Enter accepts the capitalized choice.
+For project environment or memory, enter each source project root separately, then leave the next
+source prompt empty to finish the list. For local-source operations such as `sync push`, Codelux
+first discovers existing project roots referenced by Claude Code and Codex session history and asks
+about each suggested project on its own `[y/N]` line. You can then add paths that were not suggested.
+The supplemental prompt is `Additional source project directory (leave empty to finish)`, so an
+empty response ends the list after at least one project has been selected.
+For `sync pull`, Codelux first uses a separate read-only SSH command to discover candidates from the
+remote session history, confirms them locally, and then sends the selected roots back when requesting
+the archive. If the remote version does not support discovery, Codelux reports that suggestions are
+unavailable and falls back to manual remote paths. Codelux asks for one target project root per source,
+so the command may run from any directory and can synchronize multiple projects in one transfer. Run
+`pwd` inside a project when you need its absolute path. The current directory is suggested only for
+the first manual local source and only when it is outside the user home, preventing an accidental
+whole-home project scan. Unix sockets, FIFOs, and device nodes found inside a valid project tree are
+ignored because they are not portable files; symbolic links remain rejected.
+
 The shared project allowlist includes hierarchical `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`,
 project-contained Claude imports, `.mcp.json`, selected Claude settings/rules/skills/agents/commands,
 and selected Codex configuration/rules/hooks. Local-only files such as `CLAUDE.local.md` and
-`.claude/settings.local.json` require `--local-project-env`. With multiple projects, repeat
-`--project-map SOURCE=TARGET`; mappings are explicit and never depend on option order. Offline
-imports expose only opaque project IDs and use `--target-project PROJECT_ID=TARGET`.
+`.claude/settings.local.json` require `--local-project-env`. For noninteractive multi-project
+synchronization, repeat `--project-map SOURCE=TARGET`; mappings are explicit and never depend on
+option order. Offline imports expose only opaque project IDs and use
+`--target-project PROJECT_ID=TARGET`.
 
 Authentication databases, OAuth/account state, Provider routing, Codex trust, and user-level Codex
 MCP server tables are excluded. Secret-shaped JSON fields are removed, and an MCP command argument

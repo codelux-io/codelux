@@ -411,6 +411,48 @@ def codex_session_projects(files: Mapping[str, bytes]) -> tuple[str, ...]:
     return tuple(sorted(value for (value,) in values if isinstance(value, str) and value))
 
 
+def session_project_candidates(home: Path) -> tuple[Path, ...]:
+    """Return existing safe project roots referenced by local Claude and Codex history."""
+    candidates: set[Path] = set()
+
+    def add(value: object) -> None:
+        if not isinstance(value, str):
+            return
+        path = Path(os.path.abspath(Path(value).expanduser()))
+        if path == home or not path.is_dir() or path.is_symlink():
+            return
+        candidates.add(path)
+
+    claude_root = home / ".claude" / "projects"
+    if claude_root.is_dir() and not claude_root.is_symlink():
+        for path in sorted(claude_root.rglob("*.jsonl")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                with path.open("rb") as stream:
+                    for raw_line in stream:
+                        try:
+                            record = json.loads(raw_line)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+                        if isinstance(record, dict) and isinstance(record.get("cwd"), str):
+                            add(record["cwd"])
+                            break
+            except OSError:
+                continue
+
+    database = home / ".codex" / "state_5.sqlite"
+    if database.is_file() and not database.is_symlink():
+        try:
+            content = _sqlite_backup_bytes(database)
+            for project in codex_session_projects({"codex/state_5.sqlite": content}):
+                add(project)
+        except (CodeluxError, OSError, sqlite3.Error):
+            pass
+
+    return tuple(sorted(candidates))
+
+
 def _codex_logical_path(rollout_path: str) -> Optional[str]:
     marker = "/.codex/sessions/"
     if marker in rollout_path:
@@ -727,8 +769,12 @@ def _walk_regular_files(root: Path, *, reject_symlinks: bool = True) -> Iterable
                     raise ValidationError(f"sync path is a symbolic link: {path}")
                 result.append(path)
                 continue
+            # Unix sockets, FIFOs, and device nodes can appear in otherwise valid
+            # project trees. They are not portable content and are outside every
+            # synchronization allowlist, so ignore them instead of aborting the
+            # collection of regular files.
             if not path.is_file():
-                raise ValidationError(f"sync path is not a regular file: {path}")
+                continue
             result.append(path)
     return tuple(result)
 
