@@ -38,6 +38,7 @@ SELECTIONS = {
     "user_env",
     "memory",
 }
+OVERWRITE_SCOPES = {"providers", "project_env", "user_env", "memory"}
 SyncSource = Union[Path, bytes]
 SYNC_STATE_SCHEMA = 1
 SQLITE_BACKUP_ATTEMPTS = 10
@@ -1475,7 +1476,7 @@ def _merge_provider_registry(target: Path, incoming: bytes, overwrite: bool) -> 
                 existing_clients[client] = binding
             else:
                 raise ValidationError(
-                    f"Provider binding conflict requires --overwrite: {name}/{client}"
+                    f"Provider binding conflict was not approved for overwrite: {name}/{client}"
                 )
     # The target Registry owns current: importing Providers must never switch
     # the active client configuration.
@@ -1514,7 +1515,8 @@ def _merge_claude_local_mcp(
                 current_servers[name] = server
             else:
                 raise ValidationError(
-                    f"Claude project MCP conflict requires --overwrite: {target_root}/{name}"
+                    f"Claude project MCP conflict was not approved for overwrite: "
+                    f"{target_root}/{name}"
                 )
     return (json.dumps(current, sort_keys=True, indent=2) + "\n").encode()
 
@@ -1578,7 +1580,17 @@ def apply_import(
     def allows(path: str) -> bool:
         if isinstance(overwrite, bool):
             return overwrite
-        if path.startswith("claude/") or path == "project-local-mcp.json":
+        if path == "codelux/providers.json":
+            return bool(overwrite.get("providers"))
+        if path.startswith("user-env/"):
+            return bool(overwrite.get("user_env"))
+        if path == "project-local-mcp.json":
+            return bool(overwrite.get("project_env") or overwrite.get("claude"))
+        if path.startswith("project-env/"):
+            return bool(overwrite.get("project_env"))
+        if path.startswith("project-memory/"):
+            return bool(overwrite.get("memory"))
+        if path.startswith("claude/"):
             return bool(overwrite.get("claude"))
         if path.startswith("codex/"):
             return bool(overwrite.get("codex"))
@@ -1624,7 +1636,9 @@ def apply_import(
         )
     unauthorized = [path for path in conflicts if not allows(path)]
     if unauthorized:
-        raise ValidationError(f"sync conflicts require --overwrite: {', '.join(unauthorized)}")
+        raise ValidationError(
+            "sync conflicts were not approved for overwrite: " + ", ".join(unauthorized)
+        )
 
     baseline_target = _state_path(root)
     baseline_before = baseline_target.read_bytes() if baseline_target.is_file() else None

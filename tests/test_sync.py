@@ -380,6 +380,60 @@ def test_user_environment_excludes_authentication_and_collects_extensions(tmp_pa
     assert (target / ".claude/agents/reviewer.md").read_text() == "review\n"
 
 
+def test_user_environment_conflicts_require_user_environment_overwrite_scope(
+    tmp_path: Path,
+) -> None:
+    source = _home(tmp_path / "source")
+    target = _home(tmp_path / "target")
+    (source / ".claude/settings.json").write_text('{"source":true}\n')
+    (source / ".codex/config.toml").write_text('model = "source"\n')
+    (target / ".claude/settings.json").write_text('{"target":true}\n')
+    (target / ".codex/config.toml").write_text('model = "target"\n')
+    manifest, files = build_manifest(source, ["user_env"])
+    manifest, payload = materialize_sync_files(manifest, files)
+
+    with pytest.raises(ValidationError, match="user-env/codex/config.toml"):
+        apply_import(target, manifest, payload, overwrite={"claude": True, "codex": True})
+    apply_import(target, manifest, payload, overwrite={"user_env": True})
+
+    assert json.loads((target / ".claude/settings.json").read_text()) == {"source": True}
+    assert (target / ".codex/config.toml").read_text() == 'model = "source"\n'
+
+
+def test_project_environment_conflicts_require_project_environment_overwrite_scope(
+    tmp_path: Path,
+) -> None:
+    source_home = _home(tmp_path / "source-home")
+    target_home = _home(tmp_path / "target-home")
+    source_project = tmp_path / "source-project"
+    target_project = tmp_path / "target-project"
+    source_project.mkdir()
+    target_project.mkdir()
+    (source_project / "AGENTS.md").write_text("source rules\n")
+    (target_project / "AGENTS.md").write_text("target rules\n")
+    manifest, files = build_manifest(source_home, ["project_env"], project_roots=(source_project,))
+    manifest, payload = materialize_sync_files(manifest, files)
+    mapping = {manifest.project_ids[0]: target_project}
+
+    with pytest.raises(ValidationError, match="project-env/.*/AGENTS.md"):
+        apply_import(
+            target_home,
+            manifest,
+            payload,
+            overwrite={"user_env": True},
+            environment_project_roots=mapping,
+        )
+    apply_import(
+        target_home,
+        manifest,
+        payload,
+        overwrite={"project_env": True},
+        environment_project_roots=mapping,
+    )
+
+    assert (target_project / "AGENTS.md").read_text() == "source rules\n"
+
+
 def test_agent_environment_sanitizers_remove_routing_trust_and_secrets() -> None:
     codex = sync_module._sanitize_codex_user_config(
         b'model = "gpt"\nmodel_provider = "private"\n'
@@ -557,6 +611,28 @@ def test_local_project_mcp_is_sanitized_and_merged_for_target_path(tmp_path: Pat
         payload,
         overwrite={"claude": True},
         environment_project_roots={project_id: target_project},
+    )
+    (target_home / ".claude.json").write_text(
+        json.dumps(
+            {
+                "projects": {
+                    str(target_project): {"mcpServers": {"docs": {"command": "different-again"}}}
+                }
+            }
+        )
+    )
+    apply_import(
+        target_home,
+        manifest,
+        payload,
+        overwrite={"project_env": True},
+        environment_project_roots={project_id: target_project},
+    )
+    assert (
+        json.loads((target_home / ".claude.json").read_text())["projects"][str(target_project)][
+            "mcpServers"
+        ]["docs"]["command"]
+        == "docs-server"
     )
 
 
@@ -1701,9 +1777,11 @@ def test_push_archive_negotiates_streams_and_confirms_commit(tmp_path: Path, mon
         "root@example.com",
         manifest,
         archive,
-        overwrite=True,
+        overwrite=False,
         claude_project_root="/workspace/example-project",
         progress=calls.append,
+        overwrite_clients=("claude",),
+        overwrite_scopes=("project_env", "user_env"),
         environment_project_roots={"p-0123456789abcdef01234567": tmp_path / "target"},
     )
 
@@ -1715,10 +1793,46 @@ def test_push_archive_negotiates_streams_and_confirms_commit(tmp_path: Path, mon
         "Archive sent; waiting for target commit...",
     ]
     assert "--project-map-stdin" in commands[0]
+    assert "--overwrite" not in commands[0]
+    assert "--overwrite-claude" in commands[0]
+    assert commands[0].count("--overwrite-scope") == 2
+    assert "project_env" in commands[0] and "user_env" in commands[0]
     assert str(tmp_path / "target") not in " ".join(commands[0])
     stream = io.BytesIO(bytes(process.stdin.data))
     assert read_path_payload(stream) == {"p-0123456789abcdef01234567": str(tmp_path / "target")}
     assert stream.read() == archive
+
+    with pytest.raises(ValidationError, match="unsupported overwrite scope"):
+        push_archive(
+            "root@example.com",
+            manifest,
+            archive,
+            overwrite=False,
+            overwrite_scopes=("unknown",),
+        )
+
+
+def test_push_archive_global_overwrite_uses_fixed_flag(tmp_path: Path, monkeypatch) -> None:
+    home = _home(tmp_path / "source")
+    manifest, files = build_manifest(home, ["providers"], include_keys=True)
+    process = _FakePushProcess(
+        canonical_line(local_capability(home).to_dict()) + b'{"status":"committed"}\n'
+    )
+    commands = []
+
+    def fake_popen(command, **kwargs):
+        commands.append(command)
+        return process
+
+    monkeypatch.setattr(sync_transport.subprocess, "Popen", fake_popen)
+    push_archive(
+        "root@example.com",
+        manifest,
+        create_plain_archive(manifest, files),
+        overwrite=True,
+    )
+
+    assert "--overwrite" in commands[0]
 
 
 @pytest.mark.parametrize(

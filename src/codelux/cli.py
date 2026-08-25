@@ -33,6 +33,8 @@ from codelux.registry_io import load_registry, save_registry
 from codelux.safe_files import atomic_write_private
 from codelux.snapshots import SnapshotStore
 from codelux.sync import (
+    OVERWRITE_SCOPES,
+    _claude_project_slug,
     _project_id,
     apply_import,
     build_manifest,
@@ -408,16 +410,31 @@ def _safe_confirm(prompt: str, default: bool) -> bool:
         return default
 
 
-def _session_overwrite_prompts(clients: tuple[str, ...], forced: bool) -> tuple[str, ...]:
+def _overwrite_prompts(
+    selected: tuple[str, ...], clients: tuple[str, ...], forced: bool
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     if forced:
-        return clients
-    approved = []
+        return clients, tuple(sorted(set(selected).intersection(OVERWRITE_SCOPES)))
+    approved_clients = []
     for client in clients:
         label = "Claude Code project history" if client == "claude" else "Codex session history"
         allowed = _safe_confirm(f"Allow overwriting conflicting target {label}?", default=False)
         if allowed:
-            approved.append(client)
-    return tuple(approved)
+            approved_clients.append(client)
+    scope_labels = {
+        "providers": "Providers and API keys",
+        "project_env": "project environment (including selected local overrides)",
+        "user_env": "user-level agent environment",
+        "memory": "Claude project memory",
+    }
+    requested_scopes = set(selected).intersection(OVERWRITE_SCOPES)
+    approved_scopes = []
+    for scope in ("providers", "project_env", "user_env", "memory"):
+        if scope in requested_scopes and _safe_confirm(
+            f"Allow overwriting conflicting target {scope_labels[scope]}?", default=False
+        ):
+            approved_scopes.append(scope)
+    return tuple(approved_clients), tuple(approved_scopes)
 
 
 def _project_directory(value: object, *, local: bool) -> Path:
@@ -448,6 +465,27 @@ def _claude_source_project(files: dict[str, bytes], slug: str) -> Optional[str]:
                 if isinstance(cwd, str):
                     return cwd
     return None
+
+
+def _filter_derived_claude_source_slugs(files: dict[str, bytes], slugs: list[str]) -> list[str]:
+    sources = {slug: _claude_source_project(files, slug) for slug in slugs}
+    known_paths = {
+        Path(source)
+        for source in sources.values()
+        if source is not None and Path(source).is_absolute()
+    }
+    encoded_names = {_claude_project_slug(path) for path in known_paths}
+    filtered = []
+    for slug in slugs:
+        source = sources[slug]
+        if source is None:
+            filtered.append(slug)
+            continue
+        path = Path(source)
+        if path.parent in known_paths and path.name in encoded_names:
+            continue
+        filtered.append(slug)
+    return filtered
 
 
 def _session_project_directories(files: dict[str, bytes]) -> tuple[Path, ...]:
@@ -767,6 +805,15 @@ def sync_push(
                     if entry.path.startswith("claude/projects/")
                 }
             )
+            filtered_slugs = _filter_derived_claude_source_slugs(payload, source_slugs)
+            ignored_slugs = len(source_slugs) - len(filtered_slugs)
+            if ignored_slugs:
+                click.echo(
+                    f"Ignored {ignored_slugs} Claude history project path(s) derived from "
+                    "storage keys."
+                )
+                manifest, payload = select_claude_projects(manifest, payload, tuple(filtered_slugs))
+                source_slugs = filtered_slugs
             if source_slugs:
                 if claude_project_root is not None:
                     selected_source = claude_source_project
@@ -821,7 +868,9 @@ def sync_push(
                 manifest, payload = map_codex_sessions(
                     manifest, payload, _home().absolute(), codex_roots
                 )
-            overwrite_clients = _session_overwrite_prompts(session_clients, overwrite)
+        overwrite_clients, overwrite_scopes = _overwrite_prompts(
+            selected, session_clients, overwrite
+        )
         click.echo(
             f"[3/6] Preparing transfer {manifest.transfer_id} ({len(manifest.files)} files)..."
         )
@@ -831,24 +880,17 @@ def sync_push(
         if environment_mapping:
             transport_kwargs["environment_project_roots"] = environment_mapping
         if overwrite_clients:
-            capability, response = push_archive(
-                target,
-                manifest,
-                archive,
-                overwrite,
-                progress=lambda message: click.echo(f"[4/6] {message}"),
-                overwrite_clients=overwrite_clients,
-                **transport_kwargs,
-            )
-        else:
-            capability, response = push_archive(
-                target,
-                manifest,
-                archive,
-                overwrite,
-                progress=lambda message: click.echo(f"[4/6] {message}"),
-                **transport_kwargs,
-            )
+            transport_kwargs["overwrite_clients"] = overwrite_clients
+        if overwrite_scopes:
+            transport_kwargs["overwrite_scopes"] = overwrite_scopes
+        capability, response = push_archive(
+            target,
+            manifest,
+            archive,
+            overwrite,
+            progress=lambda message: click.echo(f"[4/6] {message}"),
+            **transport_kwargs,
+        )
         click.echo(
             f"[5/6] Target accepted protocol 1 ({capability.codelux_version}); transaction committed."
         )
@@ -931,7 +973,9 @@ def sync_pull(
         if not selected:
             click.echo("No content selected; synchronization cancelled.")
             return
-        overwrite_clients = _session_overwrite_prompts(session_clients, overwrite)
+        overwrite_clients, overwrite_scopes = _overwrite_prompts(
+            selected, session_clients, overwrite
+        )
         _sync_process_preflight(selected, session_clients)
         target = ssh_target or str(click.prompt("SSH source (user@host)"))
         environment_mapping: dict[str, Path] = {}
@@ -990,6 +1034,15 @@ def sync_pull(
                     if entry.path.startswith("claude/projects/")
                 }
             )
+            filtered_slugs = _filter_derived_claude_source_slugs(files, source_slugs)
+            ignored_slugs = len(source_slugs) - len(filtered_slugs)
+            if ignored_slugs:
+                click.echo(
+                    f"Ignored {ignored_slugs} Claude history project path(s) derived from "
+                    "storage keys."
+                )
+                manifest, files = select_claude_projects(manifest, files, tuple(filtered_slugs))
+                source_slugs = filtered_slugs
             claude_roots = {}
             if claude_project_root is not None:
                 if len(source_slugs) != 1:
@@ -1027,7 +1080,7 @@ def sync_pull(
             files,
             overwrite
             if overwrite
-            else {"claude": "claude" in overwrite_clients, "codex": "codex" in overwrite_clients},
+            else {scope: True for scope in (*overwrite_clients, *overwrite_scopes)},
             None,
             codex_project_roots=codex_roots,
             environment_project_roots=environment_mapping,
@@ -1211,6 +1264,12 @@ def sync_transport_group() -> None:
 @click.option("--overwrite", is_flag=True)
 @click.option("--overwrite-claude", is_flag=True)
 @click.option("--overwrite-codex", is_flag=True)
+@click.option(
+    "--overwrite-scope",
+    "overwrite_scopes",
+    multiple=True,
+    type=click.Choice(sorted(OVERWRITE_SCOPES)),
+)
 @click.option("--claude-project-root", type=click.Path(path_type=Path))
 @click.option("--project-map-stdin", is_flag=True)
 @_sync_locked
@@ -1219,6 +1278,7 @@ def sync_transport_receive(
     overwrite: bool,
     overwrite_claude: bool,
     overwrite_codex: bool,
+    overwrite_scopes: tuple[str, ...],
     claude_project_root: Optional[Path],
     project_map_stdin: bool,
 ) -> None:
@@ -1248,6 +1308,7 @@ def sync_transport_receive(
             "claude": overwrite_claude,
             "codex": overwrite_codex,
             "providers": overwrite,
+            **{scope: True for scope in overwrite_scopes},
         }
         missing = apply_import(
             _home(),
