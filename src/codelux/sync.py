@@ -16,7 +16,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional, Union
+from typing import Any, BinaryIO, Optional, Union
 
 from codelux.client_paths import (
     claude_config_root as _claude_config_root,
@@ -1304,23 +1304,31 @@ def export_encrypted(
 
 
 def create_plain_archive(manifest: SyncManifest, files: Iterable[tuple[str, SyncSource]]) -> bytes:
-    with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as plain:
-        with tarfile.open(fileobj=plain, mode="w") as archive:
-            raw_manifest = json.dumps(
-                manifest.to_dict(), sort_keys=True, separators=(",", ":")
-            ).encode()
-            info = tarfile.TarInfo("manifest.json")
-            info.size = len(raw_manifest)
+    plain = io.BytesIO()
+    write_plain_archive(manifest, files, plain)
+    return plain.getvalue()
+
+
+def write_plain_archive(
+    manifest: SyncManifest,
+    files: Iterable[tuple[str, SyncSource]],
+    output: BinaryIO,
+) -> None:
+    """Write one validated tar stream without materializing a second archive copy."""
+    with tarfile.open(fileobj=output, mode="w|") as archive:
+        raw_manifest = json.dumps(
+            manifest.to_dict(), sort_keys=True, separators=(",", ":")
+        ).encode()
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(raw_manifest)
+        info.mode = 0o600
+        archive.addfile(info, io.BytesIO(raw_manifest))
+        for logical, path in sorted(files):
+            content = _source_content(logical, path, manifest.includes_keys)
+            info = tarfile.TarInfo(logical)
+            info.size = len(content)
             info.mode = 0o600
-            archive.addfile(info, io.BytesIO(raw_manifest))
-            for logical, path in sorted(files):
-                content = _source_content(logical, path, manifest.includes_keys)
-                info = tarfile.TarInfo(logical)
-                info.size = len(content)
-                info.mode = 0o600
-                archive.addfile(info, io.BytesIO(content))
-        plain.seek(0)
-        return plain.read()
+            archive.addfile(info, io.BytesIO(content))
 
 
 def import_encrypted(path: Path, password: str) -> tuple[SyncManifest, dict[str, bytes]]:
@@ -1363,18 +1371,28 @@ def import_encrypted(path: Path, password: str) -> tuple[SyncManifest, dict[str,
 
 
 def parse_plain_archive(plaintext: bytes) -> tuple[SyncManifest, dict[str, bytes]]:
+    return parse_plain_archive_stream(io.BytesIO(plaintext), len(plaintext))
+
+
+def parse_plain_archive_stream(
+    stream: BinaryIO, archive_size: int
+) -> tuple[SyncManifest, dict[str, bytes]]:
+    """Validate a seekable tar stream without first copying the complete archive to bytes."""
     try:
-        return _parse_plain_archive(plaintext)
+        return _parse_plain_archive_stream(stream, archive_size)
     except tarfile.TarError as exc:
         raise ValidationError("sync archive format is invalid") from exc
 
 
-def _parse_plain_archive(plaintext: bytes) -> tuple[SyncManifest, dict[str, bytes]]:
-    if len(plaintext) > MAX_TOTAL + (MAX_FILES + 1) * 1024:
+def _parse_plain_archive_stream(
+    stream: BinaryIO, archive_size: int
+) -> tuple[SyncManifest, dict[str, bytes]]:
+    if archive_size < 0 or archive_size > MAX_TOTAL + (MAX_FILES + 1) * 1024:
         raise ValidationError("sync archive exceeds total size limit")
     files: dict[str, bytes] = {}
     actual_total = 0
-    with tarfile.open(fileobj=io.BytesIO(plaintext), mode="r:") as archive:
+    stream.seek(0)
+    with tarfile.open(fileobj=stream, mode="r:") as archive:
         members = archive.getmembers()
         if not members or members[0].name != "manifest.json":
             raise ValidationError("manifest.json must be the first archive member")

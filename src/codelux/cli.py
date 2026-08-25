@@ -3,9 +3,11 @@
 import json
 import os
 import sys
+import tempfile
+from collections.abc import Mapping
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence, TypedDict, TypeVar
+from typing import Any, BinaryIO, Callable, Optional, Sequence, TypedDict, TypeVar, cast
 
 import click
 
@@ -53,16 +55,18 @@ from codelux.sync import (
     select_claude_projects,
     select_codex_projects,
     session_project_candidates,
+    write_plain_archive,
 )
 from codelux.sync_transport import (
     RemoteProjectDiscoveryUnavailable,
     canonical_line,
     discover_remote_project_candidates,
     local_capability,
-    parse_plain_archive,
     pull_archive,
     push_archive,
     read_path_payload,
+    read_preflight_payload,
+    receive_archive_stream,
     validate_capability,
 )
 
@@ -532,7 +536,35 @@ def _prompt_project_directory(label: str, *, local: bool) -> Optional[Path]:
     return _project_directory(value, local=local) if value else None
 
 
-def _codex_project_mapping(files: dict[str, bytes], *, local: bool = False) -> dict[str, Path]:
+def _history_source_key(source: Optional[str]) -> Optional[str]:
+    if source is None or not Path(source).is_absolute():
+        return None
+    return os.path.abspath(source)
+
+
+def _known_history_target(
+    source: Optional[str],
+    *,
+    local: bool,
+    environment_project_roots: Mapping[str, Path],
+    history_targets: Mapping[str, Path],
+) -> Optional[Path]:
+    source_key = _history_source_key(source)
+    if source_key is None:
+        return None
+    target = history_targets.get(source_key)
+    if target is None:
+        target = environment_project_roots.get(_project_id(Path(source_key)))
+    return _project_directory(target, local=local) if target is not None else None
+
+
+def _codex_project_mapping(
+    files: dict[str, bytes],
+    *,
+    local: bool = False,
+    environment_project_roots: Optional[Mapping[str, Path]] = None,
+    history_targets: Optional[Mapping[str, Path]] = None,
+) -> dict[str, Path]:
     projects = codex_session_projects(files)
     if not projects:
         return {}
@@ -541,9 +573,18 @@ def _codex_project_mapping(files: dict[str, bytes], *, local: bool = False) -> d
     )
     mappings = {}
     for project in projects:
-        target = _prompt_project_directory(
-            f"Target project directory for Codex source project {project}", local=local
+        target = _known_history_target(
+            project,
+            local=local,
+            environment_project_roots=environment_project_roots or {},
+            history_targets=history_targets or {},
         )
+        if target is not None:
+            click.echo(f"Reusing project mapping for Codex history {project} -> {target}")
+        else:
+            target = _prompt_project_directory(
+                f"Target project directory for Codex source project {project}", local=local
+            )
         if target is not None:
             mappings[project] = target
     return mappings
@@ -627,6 +668,7 @@ def sync_import(
             }
         )
         claude_roots = {}
+        history_targets: dict[str, Path] = {}
         if source_slugs and claude_project_root is not None:
             if claude_source_project is not None:
                 source_slug = _claude_source_slug(files, source_slugs, claude_source_project)
@@ -649,17 +691,37 @@ def sync_import(
             for slug in source_slugs:
                 source = _claude_source_project(files, slug)
                 source_label = source or f"unknown path (storage key: {slug})"
-                prompted_root = _prompt_project_directory(
-                    f"Local project directory for Claude source project {source_label}",
+                prompted_root = _known_history_target(
+                    source,
                     local=True,
+                    environment_project_roots=environment_mapping,
+                    history_targets=history_targets,
                 )
                 if prompted_root is not None:
+                    click.echo(
+                        f"Reusing project mapping for Claude history {source_label} -> "
+                        f"{prompted_root}"
+                    )
+                else:
+                    prompted_root = _prompt_project_directory(
+                        f"Local project directory for Claude source project {source_label}",
+                        local=True,
+                    )
+                if prompted_root is not None:
                     claude_roots[slug] = prompted_root
+                    source_key = _history_source_key(source)
+                    if source_key is not None:
+                        history_targets[source_key] = prompted_root
             manifest, files = select_claude_projects(manifest, files, tuple(claude_roots))
         if claude_roots:
             manifest, files = map_claude_sessions(manifest, files, claude_roots)
         codex_roots = (
-            _codex_project_mapping(files, local=True)
+            _codex_project_mapping(
+                files,
+                local=True,
+                environment_project_roots=environment_mapping,
+                history_targets=history_targets,
+            )
             if any(entry.path.startswith("codex/") for entry in manifest.files)
             else {}
         )
@@ -810,6 +872,11 @@ def sync_push(
         if "sessions" in selected:
             project_roots: dict[str, Path] = {}
             codex_roots: dict[str, Path] = {}
+            history_targets = {
+                os.path.abspath(str(source)): environment_mapping[_project_id(source)]
+                for source in environment_source_roots
+                if _project_id(source) in environment_mapping
+            }
             source_slugs = sorted(
                 {
                     entry.path.split("/", 3)[2]
@@ -864,18 +931,39 @@ def sync_push(
                     for slug in source_slugs:
                         source = _claude_source_project(payload, slug)
                         source_label = source or f"unknown path (storage key: {slug})"
-                        target_root = _prompt_project_directory(
-                            f"Target project directory for Claude source project {source_label}",
+                        target_root = _known_history_target(
+                            source,
                             local=False,
+                            environment_project_roots=environment_mapping,
+                            history_targets=history_targets,
                         )
+                        if target_root is not None:
+                            click.echo(
+                                f"Reusing project mapping for Claude history {source_label} -> "
+                                f"{target_root}"
+                            )
+                        else:
+                            target_root = _prompt_project_directory(
+                                f"Target project directory for Claude source project "
+                                f"{source_label}",
+                                local=False,
+                            )
                         if target_root is None:
                             continue
                         selected_slugs.append(slug)
                         project_roots[slug] = target_root
+                        source_key = _history_source_key(source)
+                        if source_key is not None:
+                            history_targets[source_key] = target_root
                     manifest, payload = select_claude_projects(manifest, payload, selected_slugs)
                     manifest, payload = map_claude_sessions(manifest, payload, project_roots)
             if "codex" in session_clients:
-                codex_roots = _codex_project_mapping(payload, local=False)
+                codex_roots = _codex_project_mapping(
+                    payload,
+                    local=False,
+                    environment_project_roots=environment_mapping,
+                    history_targets=history_targets,
+                )
                 manifest, payload = select_codex_projects(manifest, payload, tuple(codex_roots))
                 manifest, payload = map_codex_sessions(
                     manifest, payload, _home().absolute(), codex_roots
@@ -886,7 +974,6 @@ def sync_push(
         click.echo(
             f"[3/6] Preparing transfer {manifest.transfer_id} ({len(manifest.files)} files)..."
         )
-        archive = create_plain_archive(manifest, tuple(payload.items()))
         click.echo("[4/6] Connecting to the target and checking capabilities...")
         transport_kwargs: dict[str, Any] = {}
         if environment_mapping:
@@ -895,16 +982,24 @@ def sync_push(
             transport_kwargs["overwrite_clients"] = overwrite_clients
         if overwrite_scopes:
             transport_kwargs["overwrite_scopes"] = overwrite_scopes
-        capability, response = push_archive(
-            target,
-            manifest,
-            archive,
-            overwrite,
-            progress=lambda message: click.echo(f"[4/6] {message}"),
-            **transport_kwargs,
-        )
+        session_project_roots = _session_project_directories(payload)
+        if session_project_roots:
+            transport_kwargs["session_project_roots"] = session_project_roots
+        with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as archive:
+            archive_stream = cast(BinaryIO, archive)
+            write_plain_archive(manifest, tuple(payload.items()), archive_stream)
+            archive.seek(0)
+            capability, response = push_archive(
+                target,
+                manifest,
+                archive_stream,
+                overwrite,
+                progress=lambda message: click.echo(f"[4/6] {message}"),
+                **transport_kwargs,
+            )
         click.echo(
-            f"[5/6] Target accepted protocol 1 ({capability.codelux_version}); transaction committed."
+            f"[5/6] Target accepted the sync protocol ({capability.codelux_version}); "
+            "transaction committed."
         )
         click.echo("[6/6] Verifying synchronization result...")
         click.echo(json.dumps(response, ensure_ascii=True, indent=2))
@@ -1043,6 +1138,7 @@ def sync_pull(
             )
         elif environment_mapping and set(environment_mapping) != set(manifest.project_ids):
             raise ValidationError("project environment source mapping does not match the archive")
+        history_targets: dict[str, Path] = {}
         if "claude" in session_clients:
             source_slugs = sorted(
                 {
@@ -1075,16 +1171,38 @@ def sync_pull(
                 for slug in source_slugs:
                     source = _claude_source_project(files, slug)
                     source_label = source or f"unknown path (storage key: {slug})"
-                    target_root = _prompt_project_directory(
-                        f"Local project directory for Claude source project {source_label}",
+                    target_root = _known_history_target(
+                        source,
                         local=True,
+                        environment_project_roots=environment_mapping,
+                        history_targets=history_targets,
                     )
                     if target_root is not None:
+                        click.echo(
+                            f"Reusing project mapping for Claude history {source_label} -> "
+                            f"{target_root}"
+                        )
+                    else:
+                        target_root = _prompt_project_directory(
+                            f"Local project directory for Claude source project {source_label}",
+                            local=True,
+                        )
+                    if target_root is not None:
                         claude_roots[slug] = target_root
+                        source_key = _history_source_key(source)
+                        if source_key is not None:
+                            history_targets[source_key] = target_root
             manifest, files = select_claude_projects(manifest, files, tuple(claude_roots))
             manifest, files = map_claude_sessions(manifest, files, claude_roots)
         codex_roots = (
-            _codex_project_mapping(files, local=True) if "codex" in session_clients else {}
+            _codex_project_mapping(
+                files,
+                local=True,
+                environment_project_roots=environment_mapping,
+                history_targets=history_targets,
+            )
+            if "codex" in session_clients
+            else {}
         )
         if "codex" in session_clients:
             manifest, files = select_codex_projects(manifest, files, tuple(codex_roots))
@@ -1303,13 +1421,41 @@ def sync_transport_receive(
 ) -> None:
     """Receive one validated plaintext archive over the authenticated SSH stream."""
     try:
-        if protocol != 1:
+        if protocol not in {1, 2}:
             raise ValidationError("unsupported sync protocol")
         capability = local_capability(_home())
         click.echo(json.dumps(capability.to_dict(), sort_keys=True), nl=True)
+        sys.stdout.flush()
         input_stream = sys.stdin.buffer
         environment_mapping = {}
-        if project_map_stdin:
+        declared_manifest = None
+        declared_archive_size = None
+        declared_session_roots: tuple[Path, ...] = ()
+        if protocol == 2:
+            (
+                declared_manifest,
+                declared_archive_size,
+                raw_environment_mapping,
+                raw_session_roots,
+            ) = read_preflight_payload(input_stream)
+            environment_mapping = {
+                str(project_id): _project_directory(target, local=True)
+                for project_id, target in raw_environment_mapping.items()
+            }
+            if set(environment_mapping) != set(declared_manifest.project_ids):
+                raise ValidationError("project environment mapping is incomplete")
+            declared_session_roots = tuple(
+                _project_directory(target, local=True) for target in raw_session_roots
+            )
+            if len(set(declared_session_roots)) != len(declared_session_roots):
+                raise ValidationError("session project mappings must use distinct targets")
+            validate_capability(capability, declared_manifest, protocol=2)
+            _sync_process_preflight(
+                declared_manifest.selection, _manifest_clients(declared_manifest)
+            )
+            click.echo(json.dumps({"status": "ready"}, sort_keys=True), nl=True)
+            sys.stdout.flush()
+        elif project_map_stdin:
             decoded = read_path_payload(input_stream)
             if not isinstance(decoded, dict):
                 raise ValidationError("project path payload is invalid")
@@ -1317,11 +1463,15 @@ def sync_transport_receive(
                 str(project_id): _project_directory(target, local=True)
                 for project_id, target in decoded.items()
             }
-        raw = input_stream.read()
-        manifest, files = parse_plain_archive(raw)
-        validate_capability(capability, manifest)
+        manifest, files = receive_archive_stream(input_stream, declared_archive_size)
+        if declared_manifest is not None and manifest != declared_manifest:
+            raise ValidationError("sync archive manifest does not match preflight")
+        validate_capability(capability, manifest, protocol=protocol)
         _sync_process_preflight(manifest.selection, _manifest_clients(manifest))
-        for project_path in _session_project_directories(files):
+        actual_session_roots = _session_project_directories(files)
+        if protocol == 2 and set(actual_session_roots) != set(declared_session_roots):
+            raise ValidationError("sync session project paths do not match preflight")
+        for project_path in actual_session_roots:
             _project_directory(project_path, local=True)
         overwrite_policy = overwrite or {
             "claude": overwrite_claude,
