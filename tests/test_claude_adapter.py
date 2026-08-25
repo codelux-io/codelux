@@ -7,6 +7,19 @@ from codelux.models import ConfigState, ProcessState
 from codelux.registry import ClientBinding, ProviderRecord, Registry
 
 
+def test_claude_adapter_respects_custom_config_root(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "~/.claude-custom")
+    settings = tmp_path / ".claude-custom"
+    settings.mkdir()
+    (settings / "settings.json").write_text(json.dumps({"env": {}}))
+
+    adapter = ClaudeAdapter(tmp_path)
+
+    assert adapter.settings_path == settings / "settings.json"
+    assert adapter.is_installed()
+    assert adapter.inspect().state is ConfigState.OFFICIAL_LOGIN
+
+
 def test_claude_prepare_does_not_modify_live_file(tmp_path: Path) -> None:
     settings_dir = tmp_path / ".claude"
     settings_dir.mkdir()

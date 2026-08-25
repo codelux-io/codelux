@@ -18,6 +18,11 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Union
 
+from codelux.client_paths import (
+    claude_config_root as _claude_config_root,
+    claude_project_memory_root as _claude_project_memory_root,
+    claude_project_slug as _claude_project_slug,
+)
 from codelux.errors import CodeluxError, ValidationError
 from codelux.models import FileState, Manifest, ManifestFile, OperationState
 from codelux.safe_files import atomic_write_private, ensure_private_dir
@@ -174,7 +179,7 @@ class SyncManifest:
                 raise ValidationError("sync manifest is invalid")
             seen.add(path)
             files.append(SyncFile(path, mode, size, digest))
-        if set(selection).intersection({"project_env", "local_env", "memory"}) and not project_ids:
+        if set(selection).intersection({"project_env", "local_env"}) and not project_ids:
             raise ValidationError("sync manifest is invalid")
         for item in files:
             if item.path.startswith(("project-env/", "project-memory/")):
@@ -295,11 +300,6 @@ def _safe_relative(path: str) -> PurePosixPath:
     if candidate.is_absolute() or ".." in candidate.parts or not candidate.parts:
         raise ValidationError("sync path is unsafe")
     return candidate
-
-
-def _claude_project_slug(project_root: Path) -> str:
-    resolved = project_root.expanduser().absolute()
-    return "-" + "-".join(part for part in resolved.parts if part not in ("/", ""))
 
 
 def map_claude_sessions(
@@ -424,7 +424,7 @@ def session_project_candidates(home: Path) -> tuple[Path, ...]:
             return
         candidates.add(path)
 
-    claude_root = home / ".claude" / "projects"
+    claude_root = _claude_config_root(home) / "projects"
     if claude_root.is_dir() and not claude_root.is_symlink():
         for path in sorted(claude_root.rglob("*.jsonl")):
             if path.is_symlink() or not path.is_file():
@@ -666,23 +666,33 @@ def _derive_key(password: str, salt: bytes) -> bytes:
 PROJECT_INSTRUCTION_NAMES = {"AGENTS.md", "AGENTS.override.md", "CLAUDE.md"}
 PROJECT_SHARED_DIRS = {
     (".agents", "skills"),
+    (".claude", "agent-memory"),
+    (".claude", "hooks"),
     (".claude", "rules"),
     (".claude", "skills"),
     (".claude", "agents"),
     (".claude", "commands"),
     (".claude", "output-styles"),
+    (".claude", "workflows"),
+    (".codex", "agents"),
     (".codex", "rules"),
     (".codex", "hooks"),
 }
 USER_ENV_DIRS = {
     (".agents", "skills"),
+    (".claude", "agent-memory"),
+    (".claude", "hooks"),
     (".claude", "rules"),
     (".claude", "skills"),
     (".claude", "agents"),
     (".claude", "commands"),
     (".claude", "output-styles"),
+    (".claude", "themes"),
+    (".claude", "workflows"),
+    (".codex", "agents"),
     (".codex", "rules"),
     (".codex", "hooks"),
+    (".codex", "skills"),
 }
 WALK_PRUNE_NAMES = {
     ".git",
@@ -785,7 +795,12 @@ def _project_file_allowed(relative: Path, local: bool, fallback_names: set[str])
         return local
     if relative.name in PROJECT_INSTRUCTION_NAMES or relative.name in fallback_names:
         return True
-    if relative == Path(".mcp.json") or relative == Path(".claude/settings.json"):
+    if relative in {
+        Path(".mcp.json"),
+        Path(".worktreeinclude"),
+        Path(".claude/settings.json"),
+        Path(".codex/hooks.json"),
+    }:
         return True
     if relative == Path(".claude/settings.local.json"):
         return local
@@ -868,12 +883,15 @@ def _collect_project_environment(
 
 def _collect_user_environment(home: Path) -> tuple[tuple[str, Path], ...]:
     roots = []
+    claude_root = _claude_config_root(home)
     direct = {
         "user-env/codex/AGENTS.md": home / ".codex" / "AGENTS.md",
         "user-env/codex/AGENTS.override.md": home / ".codex" / "AGENTS.override.md",
         "user-env/codex/config.toml": home / ".codex" / "config.toml",
-        "user-env/claude/CLAUDE.md": home / ".claude" / "CLAUDE.md",
-        "user-env/claude/settings.json": home / ".claude" / "settings.json",
+        "user-env/codex/hooks.json": home / ".codex" / "hooks.json",
+        "user-env/claude/CLAUDE.md": claude_root / "CLAUDE.md",
+        "user-env/claude/settings.json": claude_root / "settings.json",
+        "user-env/claude/keybindings.json": claude_root / "keybindings.json",
     }
     for logical, path in direct.items():
         if path.is_symlink():
@@ -888,8 +906,12 @@ def _collect_user_environment(home: Path) -> tuple[tuple[str, Path], ...]:
             if path.is_file():
                 roots.append((f"user-env/codex/{path.name}", path))
     for prefix in USER_ENV_DIRS:
-        base = home.joinpath(*prefix)
+        base = (
+            claude_root.joinpath(*prefix[1:]) if prefix[0] == ".claude" else home.joinpath(*prefix)
+        )
         for path in _walk_regular_files(base):
+            if prefix == (".codex", "skills") and ".system" in path.relative_to(base).parts:
+                continue
             logical_root = "user-env/" + "/".join(prefix).lstrip(".")
             roots.append((f"{logical_root}/{path.relative_to(base).as_posix()}", path))
     return tuple(roots)
@@ -900,7 +922,7 @@ def _collect_project_memory(
 ) -> tuple[tuple[str, Path], ...]:
     result = []
     for project_id, source in projects.items():
-        memory_root = home / ".claude" / "projects" / _claude_project_slug(Path(source)) / "memory"
+        memory_root = _claude_project_memory_root(home, Path(source))
         for path in _walk_regular_files(memory_root):
             if path.suffix == ".md":
                 result.append(
@@ -909,6 +931,14 @@ def _collect_project_memory(
                         path,
                     )
                 )
+    codex_memory_root = home / ".codex" / "memories"
+    for path in _walk_regular_files(codex_memory_root):
+        result.append(
+            (
+                f"user-memory/codex/{path.relative_to(codex_memory_root).as_posix()}",
+                path,
+            )
+        )
     return tuple(result)
 
 
@@ -946,14 +976,14 @@ def collect_files(
     if not client_set.issubset({"claude", "codex"}):
         raise ValidationError("unsupported sync client")
     projects = _project_metadata(project_roots)
-    if selected.intersection({"project_env", "local_env", "memory"}) and not projects:
+    if selected.intersection({"project_env", "local_env"}) and not projects:
         raise ValidationError("project environment synchronization requires a project root")
     if "local_env" in selected and "project_env" not in selected:
         raise ValidationError("local project environment requires project environment selection")
     roots: list[tuple[str, SyncSource]] = []
     if "config" in selected:
         if "claude" in client_set:
-            roots.append(("claude/settings.json", home / ".claude/settings.json"))
+            roots.append(("claude/settings.json", _claude_config_root(home) / "settings.json"))
         if "codex" in client_set:
             roots.append(("codex/config.toml", home / ".codex/config.toml"))
         # Codex auth.json is included only for a registered/custom API-key profile.
@@ -983,7 +1013,7 @@ def collect_files(
     if "sessions" in selected:
         session_roots = []
         if "claude" in client_set:
-            session_roots.append((home / ".claude/projects", "claude/projects"))
+            session_roots.append((_claude_config_root(home) / "projects", "claude/projects"))
         if "codex" in client_set:
             session_roots.append((home / ".codex/sessions", "codex/sessions"))
         for base, prefix in session_roots:
@@ -1114,6 +1144,8 @@ def _source_content(logical: str, path: Union[Path, bytes], includes_keys: bool)
         or logical.endswith("/.mcp.json")
         or logical.endswith("/.claude/settings.json")
         or logical.endswith("/.claude/settings.local.json")
+        or logical == "user-env/codex/hooks.json"
+        or logical.endswith("/.codex/hooks.json")
     ):
         return _sanitize_json_environment(
             content, strip_claude_routing=logical.startswith("user-env/")
@@ -1589,6 +1621,8 @@ def apply_import(
         if path.startswith("project-env/"):
             return bool(overwrite.get("project_env"))
         if path.startswith("project-memory/"):
+            return bool(overwrite.get("memory"))
+        if path.startswith("user-memory/"):
             return bool(overwrite.get("memory"))
         if path.startswith("claude/"):
             return bool(overwrite.get("claude"))

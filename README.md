@@ -28,7 +28,7 @@ Codelux is not a replacement for every cc-switch feature. Choose cc-switch for a
 - Fail-closed handling for unknown or incomplete local state
 - Encrypted offline archives and OpenSSH-based synchronization
 - Explicit conflict handling for synchronized configuration and session data
-- Selective synchronization of Claude Code and Codex project/user environments and project memory
+- Selective synchronization of Claude Code and Codex project/user environments and agent memory
 
 ## Security model
 
@@ -130,7 +130,7 @@ push targets must already exist and be directories. A client that is not selecte
 synchronization does not need to be stopped.
 
 Synchronize a project's portable agent environment together with local overrides, user-level
-agent configuration, and Claude project memory:
+agent configuration, Codex user memory, and Claude memory for the selected project:
 
 ```bash
 codelux sync push --ssh user@host.example \
@@ -140,7 +140,7 @@ codelux sync push --ssh user@host.example \
 
 Without content flags, `sync push` and `sync pull` present a guided checklist that describes each
 scope and shows its default as `[Y/n]` or `[y/N]`; pressing Enter accepts the capitalized choice.
-For project environment or memory, enter each source project root separately, then leave the next
+For project environment or Claude project memory, enter each source project root separately, then leave the next
 source prompt empty to finish the list. For local-source operations such as `sync push`, Codelux
 first discovers existing project roots referenced by Claude Code and Codex session history and asks
 about each suggested project on its own `[y/N]` line. You can then add paths that were not suggested.
@@ -160,13 +160,17 @@ normal nested project directories remain available.
 
 Interactive synchronization asks separately before allowing conflicts to overwrite Providers,
 Claude history, Codex history, project environment (including selected local overrides), user-level
-agent environment, or project memory. Answering `y` grants overwrite permission only for that named
+agent environment, or agent memory. Answering `y` grants overwrite permission only for that named
 selected scope. The explicit `--overwrite` option remains the noninteractive all-selected-scopes
 override; use it only when every selected destination may be replaced.
 
 The shared project allowlist includes hierarchical `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`,
-project-contained Claude imports, `.mcp.json`, selected Claude settings/rules/skills/agents/commands,
-and selected Codex configuration/rules/hooks. Local-only files such as `CLAUDE.local.md` and
+project-contained Claude imports, `.mcp.json`, `.worktreeinclude`, Claude
+settings/rules/skills/agents/commands/hooks/workflows/agent-memory, and Codex
+configuration/rules/hooks/custom agents. The user allowlist also includes Claude keybindings and
+themes, direct Codex `hooks.json`, Codex custom agents, and compatible user-installed
+`~/.codex/skills` content except the bundled `.system` tree. Local-only files such as
+`CLAUDE.local.md` and
 `.claude/settings.local.json` require `--local-project-env`. For noninteractive multi-project
 synchronization, repeat `--project-map SOURCE=TARGET`; mappings are explicit and never depend on
 option order. Offline imports expose only opaque project IDs and use
@@ -177,6 +181,12 @@ MCP server tables are excluded. Secret-shaped JSON fields are removed, and an MC
 array is cleared in full when it contains a credential flag or recognized token prefix; reconfigure
 that command on the target. Free-form instructions and commands can still contain private material,
 so review selected files and use an encrypted export or a trusted SSH peer.
+
+The `--memory` scope contains the selected projects' Claude Markdown auto memory and the complete
+generated Codex memory tree under `~/.codex/memories`; review generated memory before transfer.
+`CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_PROJECT_DIR_NAME` are honored by synchronization. Arbitrary
+`autoMemoryDirectory` locations, absolute/home imports outside a selected project, raw plugin
+caches/data, machine trust decisions, and managed `/etc` policy remain intentionally excluded.
 
 Use `--help` on any command to inspect its current options and safety prompts.
 

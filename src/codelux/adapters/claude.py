@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from codelux.adapters.base import ClientAdapter, config_file
+from codelux.client_paths import claude_config_root
 from codelux.errors import ValidationError
 from codelux.models import ConfigFile, ConfigState, ObservedConfig, PreparedChange, ProcessState
 from codelux.registry import Registry
@@ -24,7 +25,7 @@ class ClaudeAdapter(ClientAdapter):
 
     def __init__(self, home: Optional[Path] = None, registry: Optional[Registry] = None) -> None:
         self.home = (home or Path.home()).absolute()
-        self.settings_path = self.home / ".claude" / "settings.json"
+        self.settings_path = claude_config_root(self.home) / "settings.json"
         self.config_root = self.settings_path.parent
         self.registry = registry
 

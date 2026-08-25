@@ -7,6 +7,6 @@ The public package contains product behavior only; internal development records 
 outside the distribution repository.
 """
 
-__version__ = "0.1.0a7"
+__version__ = "0.1.0a8"
 __author__ = "Codelux AI Initiative"
 __all__ = ["__version__"]

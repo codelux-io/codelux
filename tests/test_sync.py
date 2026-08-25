@@ -291,8 +291,11 @@ def test_project_environment_collects_agent_files_and_requires_local_opt_in(
     )
     project = tmp_path / "project"
     (project / ".claude/rules").mkdir(parents=True)
+    (project / ".claude/hooks").mkdir()
+    (project / ".claude/workflows").mkdir()
+    (project / ".claude/agent-memory/reviewer").mkdir(parents=True)
     (project / ".agents/skills/review").mkdir(parents=True)
-    (project / ".codex").mkdir()
+    (project / ".codex/agents").mkdir(parents=True)
     (project / "src").mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -305,11 +308,17 @@ def test_project_environment_collects_agent_files_and_requires_local_opt_in(
     (project / "CLAUDE.local.md").write_text("private\n")
     (project / "TEAM_GUIDE.md").write_text("fallback\n")
     (project / ".mcp.json").write_text("{}\n")
+    (project / ".worktreeinclude").write_text(".env.example\n")
     (project / ".claude/settings.json").write_text("{}\n")
     (project / ".claude/settings.local.json").write_text("{}\n")
     (project / ".claude/rules/testing.md").write_text("tests\n")
+    (project / ".claude/hooks/verify.sh").write_text("#!/bin/sh\n")
+    (project / ".claude/workflows/release.js").write_text("export default {}\n")
+    (project / ".claude/agent-memory/reviewer/MEMORY.md").write_text("review memory\n")
     (project / ".agents/skills/review/SKILL.md").write_text("review\n")
     (project / ".codex/config.toml").write_text('sandbox_mode = "workspace-write"\n')
+    (project / ".codex/hooks.json").write_text('{"hooks":{}}\n')
+    (project / ".codex/agents/reviewer.toml").write_text('name = "reviewer"\n')
     (project / "src/AGENTS.override.md").write_text("nested\n")
     (project / "docs").mkdir()
     (project / "docs/workflow.md").write_text("workflow\n")
@@ -322,10 +331,16 @@ def test_project_environment_collects_agent_files_and_requires_local_opt_in(
         "CLAUDE.md",
         "TEAM_GUIDE.md",
         ".mcp.json",
+        ".worktreeinclude",
         ".claude/settings.json",
         ".claude/rules/testing.md",
+        ".claude/hooks/verify.sh",
+        ".claude/workflows/release.js",
+        ".claude/agent-memory/reviewer/MEMORY.md",
         ".agents/skills/review/SKILL.md",
         ".codex/config.toml",
+        ".codex/hooks.json",
+        ".codex/agents/reviewer.toml",
         "src/AGENTS.override.md",
         "docs/workflow.md",
     }.issubset(shared_paths)
@@ -358,8 +373,24 @@ def test_user_environment_excludes_authentication_and_collects_extensions(tmp_pa
     (home / ".codex/auth.json").write_text('{"token":"never"}\n')
     (home / ".agents/skills/tool").mkdir(parents=True)
     (home / ".agents/skills/tool/SKILL.md").write_text("tool\n")
+    (home / ".codex/agents").mkdir()
+    (home / ".codex/agents/reviewer.toml").write_text('name = "reviewer"\n')
+    (home / ".codex/hooks.json").write_text('{"hooks":{},"env":{"API_KEY":"never","SAFE":"yes"}}\n')
+    (home / ".codex/skills/personal").mkdir(parents=True)
+    (home / ".codex/skills/personal/SKILL.md").write_text("personal\n")
+    (home / ".codex/skills/.system/bundled").mkdir(parents=True)
+    (home / ".codex/skills/.system/bundled/SKILL.md").write_text("bundled\n")
     (home / ".claude/agents").mkdir()
     (home / ".claude/agents/reviewer.md").write_text("review\n")
+    (home / ".claude/hooks").mkdir()
+    (home / ".claude/hooks/verify.sh").write_text("#!/bin/sh\n")
+    (home / ".claude/workflows").mkdir()
+    (home / ".claude/workflows/release.js").write_text("export default {}\n")
+    (home / ".claude/agent-memory/reviewer").mkdir(parents=True)
+    (home / ".claude/agent-memory/reviewer/MEMORY.md").write_text("learned\n")
+    (home / ".claude/themes").mkdir()
+    (home / ".claude/themes/dark.json").write_text("{}\n")
+    (home / ".claude/keybindings.json").write_text("{}\n")
     (home / ".claude/.credentials.json").write_text('{"token":"never"}\n')
     (home / ".claude.json").write_text('{"oauth":"never"}\n')
 
@@ -369,6 +400,15 @@ def test_user_environment_excludes_authentication_and_collects_extensions(tmp_pa
     assert "user-env/codex/work.config.toml" in paths
     assert "user-env/agents/skills/tool/SKILL.md" in paths
     assert "user-env/claude/agents/reviewer.md" in paths
+    assert "user-env/codex/hooks.json" in paths
+    assert "user-env/codex/agents/reviewer.toml" in paths
+    assert "user-env/codex/skills/personal/SKILL.md" in paths
+    assert "user-env/codex/skills/.system/bundled/SKILL.md" not in paths
+    assert "user-env/claude/hooks/verify.sh" in paths
+    assert "user-env/claude/workflows/release.js" in paths
+    assert "user-env/claude/agent-memory/reviewer/MEMORY.md" in paths
+    assert "user-env/claude/themes/dark.json" in paths
+    assert "user-env/claude/keybindings.json" in paths
     assert all("auth.json" not in path and "credentials" not in path for path in paths)
 
     manifest, sources = materialize_sync_files(manifest, _)
@@ -378,6 +418,76 @@ def test_user_environment_excludes_authentication_and_collects_extensions(tmp_pa
     assert (target / ".codex/work.config.toml").read_text() == 'model = "test"\n'
     assert (target / ".agents/skills/tool/SKILL.md").read_text() == "tool\n"
     assert (target / ".claude/agents/reviewer.md").read_text() == "review\n"
+    assert json.loads((target / ".codex/hooks.json").read_text())["env"] == {"SAFE": "yes"}
+    assert (target / ".codex/agents/reviewer.toml").read_text() == 'name = "reviewer"\n'
+    assert (target / ".codex/skills/personal/SKILL.md").read_text() == "personal\n"
+    assert (target / ".claude/hooks/verify.sh").read_text() == "#!/bin/sh\n"
+    assert (target / ".claude/workflows/release.js").read_text() == "export default {}\n"
+    assert (target / ".claude/agent-memory/reviewer/MEMORY.md").read_text() == "learned\n"
+    assert (target / ".claude/themes/dark.json").read_text() == "{}\n"
+    assert (target / ".claude/keybindings.json").read_text() == "{}\n"
+
+
+def test_memory_scope_collects_codex_memory_without_project_mapping(tmp_path: Path) -> None:
+    source = _home(tmp_path / "source")
+    memory = source / ".codex/memories"
+    memory.mkdir()
+    (memory / "MEMORY.md").write_text("durable\n")
+    (memory / "evidence.jsonl").write_text('{"source":"thread"}\n')
+
+    manifest, files = build_manifest(source, ["memory"])
+    assert manifest.project_ids == ()
+    assert {item.path for item in manifest.files} == {
+        "user-memory/codex/MEMORY.md",
+        "user-memory/codex/evidence.jsonl",
+    }
+
+    manifest, payload = materialize_sync_files(manifest, files)
+    target = _home(tmp_path / "target")
+    apply_import(target, manifest, payload)
+    assert (target / ".codex/memories/MEMORY.md").read_text() == "durable\n"
+    assert (target / ".codex/memories/evidence.jsonl").read_text() == ('{"source":"thread"}\n')
+
+
+def test_custom_claude_config_and_project_memory_roots_are_mapped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "~/.claude-custom")
+    monkeypatch.setenv("CLAUDE_CODE_PROJECT_DIR_NAME", "shared-memory")
+    source = _home(tmp_path / "source")
+    custom = source / ".claude-custom"
+    (custom / "hooks").mkdir(parents=True)
+    (custom / "settings.json").write_text('{"custom":true}\n')
+    (custom / "hooks/verify.sh").write_text("#!/bin/sh\n")
+    memory = custom / "projects/shared-memory/memory"
+    memory.mkdir(parents=True)
+    (memory / "MEMORY.md").write_text("shared\n")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    manifest, files = build_manifest(source, ["user_env", "memory"], project_roots=(project,))
+    paths = {item.path for item in manifest.files}
+    assert "claude" in local_capability(source).installed_clients
+    assert "user-env/claude/settings.json" in paths
+    assert "user-env/claude/hooks/verify.sh" in paths
+    assert any(path.endswith("/MEMORY.md") for path in paths if path.startswith("project-memory/"))
+
+    manifest, payload = materialize_sync_files(manifest, files)
+    target = _home(tmp_path / "target")
+    target_project = tmp_path / "target-project"
+    target_project.mkdir()
+    apply_import(
+        target,
+        manifest,
+        payload,
+        overwrite={"user_env": True},
+        environment_project_roots={manifest.project_ids[0]: target_project},
+    )
+    assert json.loads((target / ".claude-custom/settings.json").read_text()) == {"custom": True}
+    assert (target / ".claude-custom/hooks/verify.sh").read_text() == "#!/bin/sh\n"
+    assert (
+        target / ".claude-custom/projects/shared-memory/memory/MEMORY.md"
+    ).read_text() == "shared\n"
 
 
 def test_user_environment_conflicts_require_user_environment_overwrite_scope(
