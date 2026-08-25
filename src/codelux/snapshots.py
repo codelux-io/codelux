@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
+from codelux.client_paths import claude_config_root, claude_project_memory_root
 from codelux.errors import ValidationError
 from codelux.models import (
     FileState,
@@ -255,16 +256,11 @@ class SnapshotStore:
         return updated
 
 
-def _claude_project_slug(project_root: Path) -> str:
-    resolved = project_root.expanduser().absolute()
-    return "-" + "-".join(part for part in resolved.parts if part not in ("/", ""))
-
-
 def _logical_target(
     home: Path, source_path: str, project_roots: Optional[Mapping[str, str]] = None
 ) -> Path:
     targets = {
-        "claude/settings.json": home / ".claude" / "settings.json",
+        "claude/settings.json": claude_config_root(home) / "settings.json",
         "codex/config.toml": home / ".codex" / "config.toml",
         "codex/auth.json": home / ".codex" / "auth.json",
         "codex/state_5.sqlite": home / ".codex" / "state_5.sqlite",
@@ -289,9 +285,10 @@ def _logical_target(
         relative = Path(source_path.removeprefix("claude/"))
         if relative.is_absolute() or ".." in relative.parts:
             raise ValidationError("recovery session path escapes Claude root")
-        target = home / ".claude" / relative
+        claude_root = claude_config_root(home)
+        target = claude_root / relative
         try:
-            target.relative_to(home / ".claude")
+            target.relative_to(claude_root)
         except ValueError as exc:
             raise ValidationError("recovery session path escapes Claude root") from exc
         return target
@@ -321,14 +318,22 @@ def _logical_target(
         relative = Path(*parts[2:])
         if relative.is_absolute() or ".." in relative.parts:
             raise ValidationError("project memory path escapes target root")
-        memory_root = home / ".claude" / "projects" / _claude_project_slug(root) / "memory"
+        memory_root = claude_project_memory_root(home, root)
         return memory_root / relative
+    if source_path.startswith("user-memory/codex/"):
+        relative = Path(source_path.removeprefix("user-memory/codex/"))
+        if not relative.parts or relative.is_absolute() or ".." in relative.parts:
+            raise ValidationError("Codex memory path escapes target root")
+        return home / ".codex" / "memories" / relative
+    claude_root = claude_config_root(home)
     user_targets = {
         "user-env/codex/AGENTS.md": home / ".codex" / "AGENTS.md",
         "user-env/codex/AGENTS.override.md": home / ".codex" / "AGENTS.override.md",
         "user-env/codex/config.toml": home / ".codex" / "config.toml",
-        "user-env/claude/CLAUDE.md": home / ".claude" / "CLAUDE.md",
-        "user-env/claude/settings.json": home / ".claude" / "settings.json",
+        "user-env/codex/hooks.json": home / ".codex" / "hooks.json",
+        "user-env/claude/CLAUDE.md": claude_root / "CLAUDE.md",
+        "user-env/claude/settings.json": claude_root / "settings.json",
+        "user-env/claude/keybindings.json": claude_root / "keybindings.json",
     }
     if source_path in user_targets:
         return user_targets[source_path]
@@ -336,13 +341,19 @@ def _logical_target(
         return home / ".codex" / Path(source_path).name
     user_prefixes = {
         "user-env/agents/skills/": home / ".agents" / "skills",
-        "user-env/claude/rules/": home / ".claude" / "rules",
-        "user-env/claude/skills/": home / ".claude" / "skills",
-        "user-env/claude/agents/": home / ".claude" / "agents",
-        "user-env/claude/commands/": home / ".claude" / "commands",
-        "user-env/claude/output-styles/": home / ".claude" / "output-styles",
+        "user-env/claude/agent-memory/": claude_root / "agent-memory",
+        "user-env/claude/hooks/": claude_root / "hooks",
+        "user-env/claude/rules/": claude_root / "rules",
+        "user-env/claude/skills/": claude_root / "skills",
+        "user-env/claude/agents/": claude_root / "agents",
+        "user-env/claude/commands/": claude_root / "commands",
+        "user-env/claude/output-styles/": claude_root / "output-styles",
+        "user-env/claude/themes/": claude_root / "themes",
+        "user-env/claude/workflows/": claude_root / "workflows",
+        "user-env/codex/agents/": home / ".codex" / "agents",
         "user-env/codex/rules/": home / ".codex" / "rules",
         "user-env/codex/hooks/": home / ".codex" / "hooks",
+        "user-env/codex/skills/": home / ".codex" / "skills",
     }
     for prefix, root in user_prefixes.items():
         if source_path.startswith(prefix):

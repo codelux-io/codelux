@@ -11,6 +11,7 @@ import click
 
 from codelux import __version__
 from codelux.adapters import ClaudeAdapter, CodexAdapter
+from codelux.client_paths import claude_config_root
 from codelux.coordinator import TransactionCoordinator
 from codelux.errors import CodeluxError, RecoveryRequiredError, ValidationError
 from codelux.locking import OperationLock
@@ -282,7 +283,12 @@ def _sync_locked(command: F) -> F:
 @click.option("--project-env", is_flag=True, help="Synchronize shared project agent files.")
 @click.option("--local-project-env", is_flag=True, help="Include local project overrides.")
 @click.option("--user-env", is_flag=True, help="Synchronize user-level agent configuration.")
-@click.option("--memory", "include_memory", is_flag=True, help="Synchronize project memory.")
+@click.option(
+    "--memory",
+    "include_memory",
+    is_flag=True,
+    help="Synchronize Codex user memory and selected Claude project memory.",
+)
 @click.option("--project-root", multiple=True, type=click.Path(path_type=Path))
 @click.option(
     "--keys/--no-keys",
@@ -386,7 +392,8 @@ def _push_selection(
             default=False,
         )
         memory = _safe_confirm(
-            "Claude project memory: Markdown memory files for this project?", default=False
+            "Agent memory: Codex user memory and Claude memory for selected projects?",
+            default=False,
         )
     if providers:
         prompted.append("providers")
@@ -425,7 +432,7 @@ def _overwrite_prompts(
         "providers": "Providers and API keys",
         "project_env": "project environment (including selected local overrides)",
         "user_env": "user-level agent environment",
-        "memory": "Claude project memory",
+        "memory": "agent memory",
     }
     requested_scopes = set(selected).intersection(OVERWRITE_SCOPES)
     approved_scopes = []
@@ -683,7 +690,12 @@ def sync_import(
 @click.option("--project-env", is_flag=True, help="Synchronize shared project agent files.")
 @click.option("--local-project-env", is_flag=True, help="Include local project overrides.")
 @click.option("--user-env", is_flag=True, help="Synchronize user-level agent configuration.")
-@click.option("--memory", "include_memory", is_flag=True, help="Synchronize project memory.")
+@click.option(
+    "--memory",
+    "include_memory",
+    is_flag=True,
+    help="Synchronize Codex user memory and selected Claude project memory.",
+)
 @click.option("--project-root", multiple=True, type=click.Path(path_type=Path))
 @click.option("--target-project-root", multiple=True, type=click.Path(path_type=Path))
 @click.option(
@@ -913,7 +925,12 @@ def sync_push(
 @click.option("--project-env", is_flag=True, help="Synchronize shared project agent files.")
 @click.option("--local-project-env", is_flag=True, help="Include local project overrides.")
 @click.option("--user-env", is_flag=True, help="Synchronize user-level agent configuration.")
-@click.option("--memory", "include_memory", is_flag=True, help="Synchronize project memory.")
+@click.option(
+    "--memory",
+    "include_memory",
+    is_flag=True,
+    help="Synchronize Codex user memory and selected Claude project memory.",
+)
 @click.option("--project-root", multiple=True, type=click.Path(path_type=Path))
 @click.option("--target-project-root", multiple=True, type=click.Path(path_type=Path))
 @click.option(
@@ -1164,7 +1181,9 @@ def _standardize_sync_source(
                 key = None
         else:
             try:
-                settings = json.loads((adapter.home / ".claude/settings.json").read_bytes())
+                if not isinstance(adapter, ClaudeAdapter):
+                    raise ValidationError("Claude adapter is unavailable")
+                settings = json.loads(adapter.settings_path.read_bytes())
                 key = settings.get("env", {}).get("ANTHROPIC_AUTH_TOKEN")
             except (OSError, json.JSONDecodeError):
                 key = None
@@ -1203,7 +1222,7 @@ def _sync_process_preflight(
     adapters, _, _ = _adapters()
     home = _home()
     installed = {
-        "claude": (home / ".claude").exists(),
+        "claude": claude_config_root(home).exists(),
         "codex": (home / ".codex").exists(),
     }
     unsafe = [

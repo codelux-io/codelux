@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from codelux import __version__
+from codelux.client_paths import claude_config_root
 from codelux.errors import ValidationError
 from codelux.sync import (
     MAX_FILE,
@@ -98,7 +99,7 @@ class Capability:
 def local_capability(home: Path) -> Capability:
     installed = tuple(
         name
-        for name, path in (("claude", home / ".claude"), ("codex", home / ".codex"))
+        for name, path in (("claude", claude_config_root(home)), ("codex", home / ".codex"))
         if path.is_dir() and not path.is_symlink()
     )
     return Capability(

@@ -59,7 +59,7 @@ def test_sync_selection_splits_clients_and_overwrite_prompts(monkeypatch) -> Non
         "Allow overwriting conflicting target Providers and API keys?",
         "Allow overwriting conflicting target project environment (including selected local overrides)?",
         "Allow overwriting conflicting target user-level agent environment?",
-        "Allow overwriting conflicting target Claude project memory?",
+        "Allow overwriting conflicting target agent memory?",
     ]
     with pytest.raises(ValidationError, match="requires --project-env"):
         cli_module._push_selection(False, False, local_env=True)
