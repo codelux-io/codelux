@@ -12,7 +12,7 @@ from codelux.adapters.claude import ClaudeAdapter
 from codelux.adapters.codex import CodexAdapter
 from codelux.cli import main
 from codelux.errors import ValidationError
-from codelux.models import ConfigState, ProcessState
+from codelux.models import ConfigState, ObservedConfig, ProcessState
 from codelux.snapshots import SnapshotStore
 from codelux.sync import (
     _claude_project_slug,
@@ -21,7 +21,7 @@ from codelux.sync import (
     load_sync_state,
     materialize_sync_files,
 )
-from codelux.sync_transport import local_capability, parse_plain_archive
+from codelux.sync_transport import local_capability, parse_plain_archive, preflight_payload
 
 
 def test_sync_selection_splits_clients_and_overwrite_prompts(monkeypatch) -> None:
@@ -104,6 +104,29 @@ def test_codex_project_mapping_prompts_for_each_source_project(tmp_path: Path, m
     monkeypatch.setattr(cli_module.click, "prompt", lambda *args, **kwargs: next(answers))
     mappings = cli_module._codex_project_mapping({"codex/state_5.sqlite": database.read_bytes()})
     assert mappings == {"/source/one": Path("/target/one")}
+
+
+def test_codex_project_mapping_reuses_environment_target_without_prompt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = Path("/source/one")
+    target = Path("/target/one")
+    database = tmp_path / "state.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE threads (id TEXT, cwd TEXT)")
+        connection.execute("INSERT INTO threads VALUES ('one', ?)", (str(source),))
+    monkeypatch.setattr(
+        cli_module.click,
+        "prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected prompt")),
+    )
+
+    mappings = cli_module._codex_project_mapping(
+        {"codex/state_5.sqlite": database.read_bytes()},
+        environment_project_roots={cli_module._project_id(source): target},
+    )
+
+    assert mappings == {str(source): target}
 
 
 def test_project_directory_requires_real_absolute_path(tmp_path: Path) -> None:
@@ -913,6 +936,105 @@ def test_sync_push_transfers_mapped_project_environment(tmp_path: Path, monkeypa
     assert captured["mapping"] == {project_id: Path("/target/project")}
 
 
+def test_sync_push_reuses_environment_mapping_for_claude_and_codex_history(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = _claude_home(tmp_path / "home")
+    (home / ".codelux").mkdir()
+    (home / ".codelux/providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    source_project = tmp_path / "source-project"
+    source_project.mkdir()
+    (source_project / "AGENTS.md").write_text("rules\n")
+    claude_history = home / ".claude/projects/source-project"
+    claude_history.mkdir(parents=True)
+    (claude_history / "claude-session.jsonl").write_text(
+        json.dumps({"type": "message", "cwd": str(source_project)}) + "\n"
+    )
+    codex = home / ".codex"
+    codex_sessions = codex / "sessions/2026/08/25"
+    codex_sessions.mkdir(parents=True)
+    codex_session = codex_sessions / "codex-session.jsonl"
+    codex_session.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": "thread", "cwd": str(source_project)},
+            }
+        )
+        + "\n"
+    )
+    (codex / "config.toml").write_text('model_provider = "openai"\n')
+    with sqlite3.connect(codex / "state_5.sqlite") as connection:
+        connection.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, "
+            "rollout_path TEXT, cwd TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO threads VALUES ('thread', 'openai', ?, ?)",
+            (str(codex_session), str(source_project)),
+        )
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(
+        CodexAdapter,
+        "inspect",
+        lambda self: ObservedConfig(ConfigState.OFFICIAL_LOGIN, None, None, None),
+    )
+    captured = {}
+
+    def succeed(
+        target,
+        manifest,
+        archive,
+        overwrite,
+        progress=None,
+        environment_project_roots=None,
+        session_project_roots=(),
+        overwrite_clients=(),
+        overwrite_scopes=(),
+    ):
+        assert not isinstance(archive, bytes)
+        captured["archive"] = archive.read()
+        captured["mapping"] = environment_project_roots
+        captured["session_roots"] = session_project_roots
+        return local_capability(home), {"status": "committed"}
+
+    monkeypatch.setattr(cli_module, "push_archive", succeed)
+    result = CliRunner().invoke(
+        main,
+        [
+            "sync",
+            "push",
+            "--ssh",
+            "root@example.com",
+            "--project-env",
+            "--claude-sessions",
+            "--codex-sessions",
+            "--project-root",
+            str(source_project),
+            "--target-project-root",
+            "/target/project",
+            "--overwrite",
+        ],
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Target project directory for Claude source project" not in result.output
+    assert "Target project directory for Codex source project" not in result.output
+    assert f"Reusing project mapping for Claude history {source_project}" in result.output
+    assert f"Reusing project mapping for Codex history {source_project}" in result.output
+    manifest, files = parse_plain_archive(captured["archive"])
+    project_id = cli_module._project_id(source_project)
+    assert captured["mapping"] == {project_id: Path("/target/project")}
+    assert captured["session_roots"] == (Path("/target/project"),)
+    assert manifest.selection == ("project_env", "sessions")
+    assert any(path.startswith("claude/projects/-target-project/") for path in files)
+    assert "codex/state_5.sqlite" in files
+
+
 def test_sync_push_guides_multiple_project_environment_mappings(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1440,9 +1562,17 @@ def test_sync_push_maps_one_of_multiple_claude_projects(tmp_path: Path, monkeypa
     monkeypatch.setattr(CodexAdapter, "is_installed", lambda self: False)
     captured = {}
 
-    def succeed(target, manifest, archive, overwrite, progress=None):
+    def succeed(
+        target,
+        manifest,
+        archive,
+        overwrite,
+        progress=None,
+        session_project_roots=(),
+    ):
         captured["manifest"] = manifest
-        captured["archive"] = archive
+        captured["archive"] = archive.read()
+        captured["session_project_roots"] = session_project_roots
         return local_capability(home), {"status": "committed"}
 
     monkeypatch.setattr(cli_module, "push_archive", succeed)
@@ -1462,6 +1592,7 @@ def test_sync_push_maps_one_of_multiple_claude_projects(tmp_path: Path, monkeypa
     )
 
     assert result.exit_code == 0, result.output
+    assert captured["session_project_roots"] == (Path("/target/project"),)
     manifest, files = parse_plain_archive(captured["archive"])
     assert manifest == captured["manifest"]
     assert set(files) == {"claude/projects/-target-project/session.jsonl"}
@@ -1508,7 +1639,7 @@ def test_sync_status_reset_and_machine_id_rotate(tmp_path: Path) -> None:
 def test_sync_transport_endpoints_reject_wrong_protocol(tmp_path: Path) -> None:
     env = {"CODELUX_TEST_HOME": str(tmp_path)}
     runner = CliRunner()
-    received = runner.invoke(main, ["sync", "transport", "receive", "--protocol", "2"], env=env)
+    received = runner.invoke(main, ["sync", "transport", "receive", "--protocol", "3"], env=env)
     sent = runner.invoke(
         main,
         ["sync", "transport", "send", "--protocol", "2", "--providers"],
@@ -1664,6 +1795,67 @@ def test_sync_transport_receive_records_push_operation(tmp_path: Path) -> None:
     store = SnapshotStore(target / ".codelux")
     operation_id = next(path.name for path in store.backups.iterdir() if path.is_dir())
     assert store.read_manifest(operation_id).operation_type == "sync_push"
+
+
+def test_sync_transport_receive_protocol_two_preflights_then_commits(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    for home in (source, target):
+        (home / ".codelux").mkdir(parents=True)
+    registry = {"schema_version": 1, "providers": {}, "current": {}}
+    (source / ".codelux/providers.json").write_text(json.dumps(registry))
+    (target / ".codelux/providers.json").write_text(json.dumps(registry))
+    manifest, files = build_manifest(source, ["providers"], include_keys=True)
+    archive = create_plain_archive(manifest, files)
+
+    result = CliRunner().invoke(
+        main,
+        ["sync", "transport", "receive", "--protocol", "2"],
+        input=preflight_payload(manifest, len(archive)) + archive,
+        env={"CODELUX_TEST_HOME": str(target)},
+    )
+
+    assert result.exit_code == 0, result.output
+    responses = [json.loads(line) for line in result.stdout_bytes.splitlines()]
+    assert responses[0]["protocol_versions"] == [1, 2]
+    assert responses[1] == {"status": "ready"}
+    assert responses[2]["status"] == "committed"
+    assert responses[2]["transfer_id"] == manifest.transfer_id
+
+
+def test_sync_transport_receive_protocol_two_rejects_running_client_before_archive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _claude_home(tmp_path / "source")
+    target = _claude_home(tmp_path / "target")
+    (target / ".codelux").mkdir()
+    (target / ".codelux/providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    target_project = tmp_path / "target-project"
+    target_project.mkdir()
+    history = source / ".claude/projects/source"
+    history.mkdir(parents=True)
+    (history / "session.jsonl").write_text(json.dumps({"cwd": str(target_project)}) + "\n")
+    manifest, files = build_manifest(source, ["sessions"], clients=("claude",))
+    archive = create_plain_archive(manifest, files)
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.RUNNING)
+
+    result = CliRunner().invoke(
+        main,
+        ["sync", "transport", "receive", "--protocol", "2"],
+        input=preflight_payload(
+            manifest,
+            len(archive),
+            session_project_roots=(target_project,),
+        ),
+        env={"CODELUX_TEST_HOME": str(target)},
+    )
+
+    assert result.exit_code != 0
+    assert "sync clients are running or process state is unknown: claude" in result.output
+    assert b'"status": "ready"' not in result.stdout_bytes
+    assert not (target / ".claude/projects/source/session.jsonl").exists()
 
 
 def test_sync_transport_receive_enforces_user_environment_overwrite_scope(

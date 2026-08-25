@@ -1,4 +1,5 @@
 import hashlib
+import errno
 import io
 import json
 import os
@@ -42,6 +43,7 @@ from codelux.sync_transport import (
     push_archive,
     read_capability,
     read_path_payload,
+    read_preflight_payload,
     ssh_command,
     validate_capability,
 )
@@ -1850,6 +1852,9 @@ class _FakeInput:
     def close(self) -> None:
         self.closed = True
 
+    def flush(self) -> None:
+        pass
+
 
 class _FakePushProcess:
     def __init__(self, stdout: bytes, stderr: bytes = b"", code: int = 0) -> None:
@@ -1858,12 +1863,17 @@ class _FakePushProcess:
         self.stderr = io.BytesIO(stderr)
         self.code = code
         self.killed = False
+        self.waited = False
 
-    def wait(self) -> int:
+    def wait(self, timeout=None) -> int:
+        self.waited = True
         return self.code
 
     def kill(self) -> None:
         self.killed = True
+
+    def poll(self):
+        return self.code if self.waited or self.killed else None
 
 
 def test_push_archive_negotiates_streams_and_confirms_commit(tmp_path: Path, monkeypatch) -> None:
@@ -1872,7 +1882,9 @@ def test_push_archive_negotiates_streams_and_confirms_commit(tmp_path: Path, mon
     archive = create_plain_archive(manifest, files)
     capability = local_capability(home)
     process = _FakePushProcess(
-        canonical_line(capability.to_dict()) + b'{"status":"committed","operation":"op"}\n'
+        canonical_line(capability.to_dict())
+        + b'{"status":"ready"}\n'
+        + b'{"status":"committed","operation":"op"}\n'
     )
     calls = []
     commands = []
@@ -1899,17 +1911,23 @@ def test_push_archive_negotiates_streams_and_confirms_commit(tmp_path: Path, mon
     assert response["operation"] == "op"
     assert calls == [
         "Opening SSH connection...",
-        "Remote capability check passed; sending archive...",
+        "Remote capability check passed for protocol 2.",
+        "Remote preflight passed; sending archive...",
         "Archive sent; waiting for target commit...",
     ]
-    assert "--project-map-stdin" in commands[0]
+    assert "--project-map-stdin" not in commands[0]
+    assert commands[0][commands[0].index("--protocol") + 1] == "2"
     assert "--overwrite" not in commands[0]
     assert "--overwrite-claude" in commands[0]
     assert commands[0].count("--overwrite-scope") == 2
     assert "project_env" in commands[0] and "user_env" in commands[0]
     assert str(tmp_path / "target") not in " ".join(commands[0])
     stream = io.BytesIO(bytes(process.stdin.data))
-    assert read_path_payload(stream) == {"p-0123456789abcdef01234567": str(tmp_path / "target")}
+    declared_manifest, declared_size, mapping, session_roots = read_preflight_payload(stream)
+    assert declared_manifest == manifest
+    assert declared_size == len(archive)
+    assert mapping == {"p-0123456789abcdef01234567": str(tmp_path / "target")}
+    assert session_roots == ()
     assert stream.read() == archive
 
     with pytest.raises(ValidationError, match="unsupported overwrite scope"):
@@ -1926,7 +1944,9 @@ def test_push_archive_global_overwrite_uses_fixed_flag(tmp_path: Path, monkeypat
     home = _home(tmp_path / "source")
     manifest, files = build_manifest(home, ["providers"], include_keys=True)
     process = _FakePushProcess(
-        canonical_line(local_capability(home).to_dict()) + b'{"status":"committed"}\n'
+        canonical_line(local_capability(home).to_dict())
+        + b'{"status":"ready"}\n'
+        + b'{"status":"committed"}\n'
     )
     commands = []
 
@@ -1964,14 +1984,14 @@ def test_push_archive_rejects_remote_failures_and_invalid_acknowledgements(
     home = _home(tmp_path / "source")
     manifest, files = build_manifest(home, ["providers"], include_keys=True)
     capability = canonical_line(local_capability(home).to_dict())
-    process = _FakePushProcess(capability + response, stderr, code)
+    process = _FakePushProcess(capability + b'{"status":"ready"}\n' + response, stderr, code)
     monkeypatch.setattr(sync_transport.subprocess, "Popen", lambda *args, **kwargs: process)
 
     with pytest.raises(ValidationError, match=message):
         push_archive("root@example.com", manifest, create_plain_archive(manifest, files), False)
 
 
-def test_push_archive_kills_transport_when_capability_read_fails(
+def test_push_archive_reaps_transport_when_capability_read_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
     home = _home(tmp_path / "source")
@@ -1981,7 +2001,184 @@ def test_push_archive_kills_transport_when_capability_read_fails(
 
     with pytest.raises(ValidationError, match="capability"):
         push_archive("root@example.com", manifest, create_plain_archive(manifest, files), False)
+    assert process.waited
+
+
+def test_push_archive_rejects_preflight_before_sending_archive(tmp_path: Path, monkeypatch) -> None:
+    home = _home(tmp_path / "source")
+    manifest, files = build_manifest(home, ["providers"], include_keys=True)
+    archive = create_plain_archive(manifest, files)
+    process = _FakePushProcess(
+        canonical_line(local_capability(home).to_dict()),
+        b"Error: sync clients are running: codex",
+        1,
+    )
+    monkeypatch.setattr(sync_transport.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    with pytest.raises(ValidationError, match="sync clients are running: codex"):
+        push_archive("root@example.com", manifest, archive, False)
+
+    stream = io.BytesIO(bytes(process.stdin.data))
+    declared_manifest, declared_size, _, _ = read_preflight_payload(stream)
+    assert declared_manifest == manifest
+    assert declared_size == len(archive)
+    assert stream.read() == b""
+
+
+def test_push_archive_reports_remote_error_when_archive_pipe_breaks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class BrokenArchiveInput(_FakeInput):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes = 0
+
+        def write(self, content: bytes) -> int:
+            self.writes += 1
+            if self.writes > 1:
+                raise OSError(errno.EPIPE, "broken pipe")
+            return super().write(content)
+
+    home = _home(tmp_path / "source")
+    manifest, files = build_manifest(home, ["providers"], include_keys=True)
+    process = _FakePushProcess(
+        canonical_line(local_capability(home).to_dict()) + b'{"status":"ready"}\n',
+        b"Error: receiver rejected staged archive",
+        1,
+    )
+    process.stdin = BrokenArchiveInput()
+    monkeypatch.setattr(sync_transport.subprocess, "Popen", lambda *args, **kwargs: process)
+
+    with pytest.raises(ValidationError, match="receiver rejected staged archive"):
+        push_archive("root@example.com", manifest, create_plain_archive(manifest, files), False)
+
     assert process.killed
+
+
+def test_push_archive_falls_back_to_protocol_one_for_older_receiver(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = _home(tmp_path / "source")
+    manifest, files = build_manifest(home, ["providers"], include_keys=True)
+    archive = create_plain_archive(manifest, files)
+    old = _FakePushProcess(b"", b"Error: unsupported sync protocol", 1)
+    legacy_capability = Capability(
+        (1,),
+        local_capability(home).supported_selections,
+        local_capability(home).installed_clients,
+        local_capability(home).max_file_size,
+        local_capability(home).max_file_count,
+        local_capability(home).max_total_size,
+        True,
+        "legacy-machine",
+        "0.1.0a8",
+    )
+    legacy = _FakePushProcess(
+        canonical_line(legacy_capability.to_dict()) + b'{"status":"committed"}\n'
+    )
+    processes = iter((old, legacy))
+    commands = []
+
+    def fake_popen(command, **kwargs):
+        commands.append(command)
+        return next(processes)
+
+    monkeypatch.setattr(sync_transport.subprocess, "Popen", fake_popen)
+    progress = []
+    remote, response = push_archive(
+        "root@example.com",
+        manifest,
+        archive,
+        False,
+        progress=progress.append,
+        environment_project_roots={"p-legacy": Path("/target/project")},
+    )
+
+    assert remote == legacy_capability
+    assert response["status"] == "committed"
+    assert [command[command.index("--protocol") + 1] for command in commands] == ["2", "1"]
+    assert "retrying with legacy protocol 1" in " ".join(progress)
+    legacy_stream = io.BytesIO(bytes(legacy.stdin.data))
+    assert read_path_payload(legacy_stream) == {"p-legacy": "/target/project"}
+    assert legacy_stream.read() == archive
+
+
+def test_preflight_rejects_invalid_sizes_and_frames(tmp_path: Path) -> None:
+    home = _home(tmp_path / "source")
+    manifest, _ = build_manifest(home, ["providers"], include_keys=True)
+
+    with pytest.raises(ValidationError, match="total size limit"):
+        sync_transport.preflight_payload(manifest, -1)
+    with pytest.raises(ValidationError, match="missing or too large"):
+        sync_transport.read_preflight_payload(io.BytesIO(b""))
+    with pytest.raises(ValidationError, match="payload is invalid"):
+        sync_transport.read_preflight_payload(io.BytesIO(b"{}\n"))
+
+    invalid = json.loads(sync_transport.preflight_payload(manifest, 0))
+    invalid["archive_size"] = True
+    with pytest.raises(ValidationError, match="payload is invalid"):
+        sync_transport.read_preflight_payload(io.BytesIO(canonical_line(invalid)))
+
+
+def test_receive_archive_stream_enforces_declared_size(tmp_path: Path) -> None:
+    home = _home(tmp_path / "source")
+    manifest, files = build_manifest(home, ["providers"], include_keys=True)
+    archive = create_plain_archive(manifest, files)
+
+    with pytest.raises(ValidationError, match="exceeds declared size"):
+        sync_transport.receive_archive_stream(io.BytesIO(archive), len(archive) - 1)
+    with pytest.raises(ValidationError, match="does not match preflight"):
+        sync_transport.receive_archive_stream(io.BytesIO(archive), len(archive) + 1)
+
+
+def test_archive_stream_helpers_reject_unsafe_streams_and_bound_errors() -> None:
+    class OversizedStream:
+        def seek(self, *args) -> None:
+            pass
+
+        def tell(self) -> int:
+            return sync_transport.MAX_ARCHIVE_SIZE + 1
+
+    class ErrorProcess:
+        def __init__(self, stderr) -> None:
+            self.stdin = _FakeInput()
+            self.stderr = stderr
+            self.killed = False
+            self.waited = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self) -> int:
+            self.waited = True
+            return 0
+
+    with pytest.raises(ValidationError, match="must be seekable"):
+        sync_transport._archive_size(object())
+    with pytest.raises(ValidationError, match="total size limit"):
+        sync_transport._archive_size(OversizedStream())
+    assert sync_transport._remote_stderr(ErrorProcess(None)) == ""
+    truncated = sync_transport._remote_stderr(
+        ErrorProcess(io.BytesIO(b"x" * (sync_transport.MAX_REMOTE_ERROR + 1)))
+    )
+    assert truncated.endswith("[remote error truncated]")
+
+    process = ErrorProcess(io.BytesIO())
+    progress = []
+    content = io.BytesIO(b"x" * (4 * sync_transport.ARCHIVE_CHUNK))
+    sync_transport._send_archive(
+        process,
+        content,
+        4 * sync_transport.ARCHIVE_CHUNK,
+        progress.append,
+    )
+    assert len(progress) == 4
+    assert process.stdin.closed
+
+    changed = ErrorProcess(io.BytesIO())
+    with pytest.raises(ValidationError, match="size changed"):
+        sync_transport._send_archive(changed, b"x", 2, None)
+    assert changed.killed and changed.waited
 
 
 def test_pull_archive_rejects_invalid_selection_before_starting_ssh(tmp_path: Path) -> None:
@@ -2211,7 +2408,7 @@ def test_transport_send_outputs_capability_then_archive(tmp_path: Path) -> None:
     stream = io.BytesIO(result.stdout_bytes)
     capability = read_capability(stream)
     manifest, payload = sync_transport.decode_transport_archive(stream.read())
-    assert capability.protocol_versions == (1,)
+    assert capability.protocol_versions == (1, 2)
     assert manifest.selection == ("providers",)
     assert set(payload) == {"codelux/providers.json"}
     assert (home / ".codelux/providers.json").read_bytes() == registry_before
