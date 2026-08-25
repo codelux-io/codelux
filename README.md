@@ -154,7 +154,15 @@ so the command may run from any directory and can synchronize multiple projects 
 `pwd` inside a project when you need its absolute path. The current directory is suggested only for
 the first manual local source and only when it is outside the user home, preventing an accidental
 whole-home project scan. Unix sockets, FIFOs, and device nodes found inside a valid project tree are
-ignored because they are not portable files; symbolic links remain rejected.
+ignored because they are not portable files; symbolic links remain rejected. Claude history paths
+that merely append an encoded Claude storage key beneath another discovered project are ignored;
+normal nested project directories remain available.
+
+Interactive synchronization asks separately before allowing conflicts to overwrite Providers,
+Claude history, Codex history, project environment (including selected local overrides), user-level
+agent environment, or project memory. Answering `y` grants overwrite permission only for that named
+selected scope. The explicit `--overwrite` option remains the noninteractive all-selected-scopes
+override; use it only when every selected destination may be replaced.
 
 The shared project allowlist includes hierarchical `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`,
 project-contained Claude imports, `.mcp.json`, selected Claude settings/rules/skills/agents/commands,

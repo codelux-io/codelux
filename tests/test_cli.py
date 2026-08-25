@@ -25,7 +25,7 @@ from codelux.sync_transport import local_capability, parse_plain_archive
 
 
 def test_sync_selection_splits_clients_and_overwrite_prompts(monkeypatch) -> None:
-    answers = iter([True, True, True, True, True, True, True, True])
+    answers = iter([True, True, True, True, True, True, True])
     monkeypatch.setattr(cli_module.click, "confirm", lambda *args, **kwargs: next(answers))
     selected, clients, _ = cli_module._push_selection(False, False)
     assert selected == (
@@ -37,12 +37,59 @@ def test_sync_selection_splits_clients_and_overwrite_prompts(monkeypatch) -> Non
         "memory",
     )
     assert clients == ("claude", "codex")
-    assert cli_module._session_overwrite_prompts(clients, True) == clients
-    assert cli_module._session_overwrite_prompts(("claude",), False) == ("claude",)
+    assert cli_module._overwrite_prompts(selected, clients, True) == (
+        clients,
+        ("memory", "project_env", "providers", "user_env"),
+    )
+    prompts = []
+    approvals = iter([True, False, True, False, True, False])
+
+    def confirm(prompt, **kwargs):
+        prompts.append(prompt)
+        return next(approvals)
+
+    monkeypatch.setattr(cli_module.click, "confirm", confirm)
+    assert cli_module._overwrite_prompts(selected, clients, False) == (
+        ("claude",),
+        ("providers", "user_env"),
+    )
+    assert prompts == [
+        "Allow overwriting conflicting target Claude Code project history?",
+        "Allow overwriting conflicting target Codex session history?",
+        "Allow overwriting conflicting target Providers and API keys?",
+        "Allow overwriting conflicting target project environment (including selected local overrides)?",
+        "Allow overwriting conflicting target user-level agent environment?",
+        "Allow overwriting conflicting target Claude project memory?",
+    ]
     with pytest.raises(ValidationError, match="requires --project-env"):
         cli_module._push_selection(False, False, local_env=True)
     with pytest.raises(ValidationError, match="requires --project-env"):
         cli_module._sync_selection(False, False, False, local_env=True)
+
+
+def test_derived_claude_storage_paths_are_filtered_without_removing_nested_projects() -> None:
+    project = Path("/Users/example/work/project")
+    nested = project / "nested"
+    other = Path("/Users/example/work/other")
+    derived = other / _claude_project_slug(project)
+    sources = {
+        "project": project,
+        "nested": nested,
+        "other": other,
+        "derived": derived,
+    }
+    files = {
+        f"claude/projects/{slug}/session.jsonl": json.dumps({"cwd": str(path)}).encode()
+        for slug, path in sources.items()
+    }
+    files["claude/projects/unavailable/session.jsonl"] = b'{"type":"message"}\n'
+
+    assert cli_module._filter_derived_claude_source_slugs(files, [*sources, "unavailable"]) == [
+        "project",
+        "nested",
+        "other",
+        "unavailable",
+    ]
 
 
 def test_codex_project_mapping_prompts_for_each_source_project(tmp_path: Path, monkeypatch) -> None:
@@ -776,6 +823,43 @@ def test_sync_push_provider_success_and_registry_compensation(tmp_path: Path, mo
     )
     assert failed.exit_code != 0 and "injected push failure" in failed.output
     assert (root / "providers.json").read_bytes() == adopted
+
+
+def test_sync_push_passes_confirmed_user_environment_overwrite_scope(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = _claude_home(tmp_path)
+    (home / ".codelux").mkdir()
+    (home / ".codelux/providers.json").write_text(
+        json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+    )
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    captured = {}
+
+    def succeed(
+        target,
+        manifest,
+        archive,
+        overwrite,
+        progress=None,
+        overwrite_scopes=(),
+    ):
+        captured["overwrite"] = overwrite
+        captured["overwrite_scopes"] = overwrite_scopes
+        return local_capability(home), {"status": "committed"}
+
+    monkeypatch.setattr(cli_module, "push_archive", succeed)
+    result = CliRunner().invoke(
+        main,
+        ["sync", "push", "--ssh", "root@example.com", "--user-env"],
+        input="y\n",
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Allow overwriting conflicting target user-level agent environment?" in result.output
+    assert captured == {"overwrite": False, "overwrite_scopes": ("user_env",)}
 
 
 def test_sync_push_transfers_mapped_project_environment(tmp_path: Path, monkeypatch) -> None:
@@ -1580,6 +1664,56 @@ def test_sync_transport_receive_records_push_operation(tmp_path: Path) -> None:
     store = SnapshotStore(target / ".codelux")
     operation_id = next(path.name for path in store.backups.iterdir() if path.is_dir())
     assert store.read_manifest(operation_id).operation_type == "sync_push"
+
+
+def test_sync_transport_receive_enforces_user_environment_overwrite_scope(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = _claude_home(tmp_path / "source")
+    target = _claude_home(tmp_path / "target")
+    for home in (source, target):
+        (home / ".codelux").mkdir()
+        (home / ".codelux/providers.json").write_text(
+            json.dumps({"schema_version": 1, "providers": {}, "current": {}})
+        )
+    (source / ".claude/settings.json").write_text('{"source":true}\n')
+    (target / ".claude/settings.json").write_text('{"target":true}\n')
+    manifest, files = build_manifest(source, ["user_env"])
+    manifest, payload = materialize_sync_files(manifest, files)
+    archive = create_plain_archive(manifest, tuple(payload.items()))
+    monkeypatch.setattr(ClaudeAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    monkeypatch.setattr(CodexAdapter, "is_running", lambda self: ProcessState.NOT_RUNNING)
+    runner = CliRunner()
+
+    rejected = runner.invoke(
+        main,
+        ["sync", "transport", "receive", "--protocol", "1"],
+        input=archive,
+        env={"CODELUX_TEST_HOME": str(target)},
+    )
+    assert rejected.exit_code != 0
+    assert (
+        "sync conflicts were not approved for overwrite: user-env/claude/settings.json"
+        in rejected.output
+    )
+    assert (target / ".claude/settings.json").read_text() == '{"target":true}\n'
+
+    accepted = runner.invoke(
+        main,
+        [
+            "sync",
+            "transport",
+            "receive",
+            "--protocol",
+            "1",
+            "--overwrite-scope",
+            "user_env",
+        ],
+        input=archive,
+        env={"CODELUX_TEST_HOME": str(target)},
+    )
+    assert accepted.exit_code == 0, accepted.output
+    assert json.loads((target / ".claude/settings.json").read_text()) == {"source": True}
 
 
 def test_sync_transport_receive_checks_selected_target_process(tmp_path: Path, monkeypatch) -> None:

@@ -14,6 +14,7 @@ from codelux.sync import (
     MAX_FILE,
     MAX_FILES,
     MAX_TOTAL,
+    OVERWRITE_SCOPES,
     SELECTIONS,
     SyncManifest,
     machine_id,
@@ -215,6 +216,7 @@ def push_archive(
     claude_project_root: Optional[str] = None,
     progress: Optional[Callable[[str], None]] = None,
     overwrite_clients: Sequence[str] = (),
+    overwrite_scopes: Sequence[str] = (),
     environment_project_roots: Optional[Mapping[str, Path]] = None,
 ) -> tuple[Capability, dict[str, Any]]:
     args = ["receive", "--protocol", "1"]
@@ -224,6 +226,10 @@ def push_archive(
         if client not in {"claude", "codex"}:  # pragma: no cover - validated internal input
             raise ValidationError("unsupported overwrite client")
         args.append(f"--overwrite-{client}")  # pragma: no cover - validated internal input
+    for scope in sorted(set(overwrite_scopes)):
+        if scope not in OVERWRITE_SCOPES:
+            raise ValidationError("unsupported overwrite scope")
+        args.extend(["--overwrite-scope", scope])
     if claude_project_root:
         args.extend(["--claude-project-root", claude_project_root])
     mapping_payload = b""
