@@ -92,6 +92,24 @@ Activate an already registered Provider for Codex:
 codelux switch codelux-io --client codex
 ```
 
+Ordinary Provider switches update routing and authentication configuration only. They do not scan
+or rewrite existing Codex session history. By default, future Codex sessions use the shared
+`custom` Provider alias so they remain visible while switching Providers. Use
+`--no-shared-session` when future sessions should retain separate Provider identifiers.
+
+To integrate existing same-agent Codex sessions across different Providers, stop Codex and run the
+explicit merge:
+
+```bash
+codelux sessions merge --client codex
+```
+
+The merge rewrites every historical non-`custom` Provider identifier to the shared `custom` alias,
+including identifiers for removed or unknown Providers. It may take time proportional to the size
+of the session history. It does not change the active Provider, credentials, or Registry. Only
+changed history files are staged in `~/.codelux/sync-transactions` for rollback, and the temporary
+payload is removed after a successful merge.
+
 Return Claude Code to its official configuration or login flow:
 
 ```bash

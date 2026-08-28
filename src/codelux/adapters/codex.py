@@ -191,8 +191,6 @@ class CodexAdapter(ClientAdapter):
         binding: Mapping[str, object],
         *,
         shared_session: bool = True,
-        session_sources: Optional[set[str]] = None,
-        migrate_sessions: bool = True,
     ) -> PreparedChange:
         config, config_raw, _ = self._read_config()
         auth, auth_raw, _ = self._read_auth()
@@ -215,13 +213,6 @@ class CodexAdapter(ClientAdapter):
             ).encode()
             + b"\n"
         )
-        session = None
-        if shared_session and migrate_sessions:
-            sources = set(session_sources or {"openai"})
-            current_provider = config.get("model_provider") if config else None
-            if isinstance(current_provider, str):
-                sources.add(current_provider)
-            session = CodexSessionManager(self.home).prepare(sources)
         detected = self.inspect()
         if detected.state is not ConfigState.EXTERNAL_OVERRIDE and _has_chatgpt_login(auth_raw):
             detected = ObservedConfig(
@@ -236,7 +227,6 @@ class CodexAdapter(ClientAdapter):
             (config_file(self.config_path, config_raw), config_file(self.auth_path, auth_raw)),
             (config_file(self.config_path, after_config), config_file(self.auth_path, after_auth)),
             detected,
-            session,
         )
         self.validate_files(change.after)
         return change
@@ -246,7 +236,6 @@ class CodexAdapter(ClientAdapter):
         manifest: Mapping[str, object],
         *,
         shared_session: bool = True,
-        session_sources: Optional[set[str]] = None,
     ) -> PreparedChange:
         config_before = self.config_path.read_bytes()
         auth_before = self.auth_path.read_bytes()
@@ -254,11 +243,6 @@ class CodexAdapter(ClientAdapter):
         auth_after = _snapshot_file(manifest, "codex/auth.json", self.home / ".codelux")
         if _has_chatgpt_login(auth_after):
             config_after = _configure_official_config(config_after, shared_session)
-        session = (
-            CodexSessionManager(self.home).prepare(set(session_sources or {"openai"}))
-            if shared_session
-            else None
-        )
         change = PreparedChange(
             "codex",
             (
@@ -267,7 +251,6 @@ class CodexAdapter(ClientAdapter):
             ),
             (config_file(self.config_path, config_after), config_file(self.auth_path, auth_after)),
             self.inspect(),
-            session,
         )
         self.validate_files(change.after)
         return change
@@ -281,18 +264,12 @@ class CodexAdapter(ClientAdapter):
         self,
         *,
         shared_session: bool = True,
-        session_sources: Optional[set[str]] = None,
     ) -> PreparedChange:
         """Select the built-in OpenAI Provider while preserving native login state."""
         config, config_raw, _ = self._read_config()
         auth, auth_raw, _ = self._read_auth()
         if config is None or auth is None or not _has_chatgpt_login(auth_raw):
             raise ValidationError("Codex official login is not available")
-        session = (
-            CodexSessionManager(self.home).prepare(set(session_sources or {"openai"}))
-            if shared_session
-            else None
-        )
         change = PreparedChange(
             "codex",
             (config_file(self.config_path, config_raw), config_file(self.auth_path, auth_raw)),
@@ -304,7 +281,6 @@ class CodexAdapter(ClientAdapter):
                 config_file(self.auth_path, auth_raw),
             ),
             self.inspect(),
-            session,
         )
         self.validate_files(change.after)
         return change

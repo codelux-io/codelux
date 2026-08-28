@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -17,6 +18,9 @@ from codelux.models import (
 )
 from codelux.registry_io import load_registry
 from codelux.snapshots import SnapshotStore
+from codelux.sessions import CodexSessionManager
+
+SESSION_ID = "12345678-1234-1234-1234-123456789abc"
 
 
 def _dual_home(tmp_path: Path) -> Path:
@@ -113,7 +117,9 @@ def test_switch_no_shared_session_preserves_codex_history(tmp_path: Path, monkey
     assert session.read_bytes() == before
 
 
-def test_switch_shares_codex_session_by_default(tmp_path: Path, monkeypatch) -> None:
+def test_switch_does_not_scan_or_rewrite_codex_history_by_default(
+    tmp_path: Path, monkeypatch
+) -> None:
     _not_running(monkeypatch)
     home = _dual_home(tmp_path)
     env = {"CODELUX_TEST_HOME": str(home)}
@@ -126,9 +132,143 @@ def test_switch_shares_codex_session_by_default(tmp_path: Path, monkeypatch) -> 
         json.dumps({"type": "session_meta", "payload": {"id": "sid", "model_provider": "openai"}})
         + "\n"
     )
+    before = session.read_bytes()
+    monkeypatch.setattr(
+        CodexSessionManager,
+        "prepare",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("history was scanned")),
+    )
     switched = runner.invoke(main, ["switch", "proxy", "--client", "codex"], env=env)
     assert switched.exit_code == 0, switched.output
+    assert session.read_bytes() == before
+
+
+def test_sessions_merge_integrates_history_without_changing_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _not_running(monkeypatch)
+    home = _dual_home(tmp_path)
+    env = {"CODELUX_TEST_HOME": str(home)}
+    runner = CliRunner()
+    assert _add_dual_provider(runner, env).exit_code == 0
+    codex = home / ".codex"
+    session_root = codex / "sessions" / "2026" / "08" / "08"
+    session_root.mkdir(parents=True)
+    session = session_root / f"rollout-2026-08-08T00-00-00-{SESSION_ID}.jsonl"
+    session.write_text(
+        json.dumps(
+            {"type": "session_meta", "payload": {"id": SESSION_ID, "model_provider": "removed"}}
+        )
+        + "\n"
+    )
+    database = codex / "state_5.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE threads (id TEXT, model_provider TEXT)")
+        connection.execute("INSERT INTO threads VALUES (?, 'unknown')", (SESSION_ID,))
+    config_before = (codex / "config.toml").read_bytes()
+    auth_before = (codex / "auth.json").read_bytes()
+    registry_before = (home / ".codelux/providers.json").read_bytes()
+
+    merged = runner.invoke(main, ["sessions", "merge", "--client", "codex"], env=env)
+    assert merged.exit_code == 0, merged.output
+    assert merged.output == "Merged Codex sessions across Providers\n"
     assert json.loads(session.read_text())["payload"]["model_provider"] == "custom"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT model_provider FROM threads").fetchone()[0] == "custom"
+    assert (codex / "config.toml").read_bytes() == config_before
+    assert (codex / "auth.json").read_bytes() == auth_before
+    assert (home / ".codelux/providers.json").read_bytes() == registry_before
+    transactions = home / ".codelux/sync-transactions"
+    assert not list(transactions.glob("*/manifest.json"))
+
+    repeated = runner.invoke(main, ["sessions", "merge", "--client", "codex"], env=env)
+    assert repeated.exit_code == 0, repeated.output
+    assert repeated.output == "Codex sessions are already merged across Providers\n"
+
+
+def test_sessions_merge_rejects_running_codex(tmp_path: Path, monkeypatch) -> None:
+    home = _dual_home(tmp_path)
+    (home / ".codelux").mkdir()
+    monkeypatch.setattr(CodexAdapter, "is_running", lambda self: ProcessState.RUNNING)
+    result = CliRunner().invoke(
+        main,
+        ["sessions", "merge", "--client", "codex"],
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+    assert result.exit_code != 0
+    assert "codex is running" in result.output
+
+
+def test_sessions_merge_commit_failure_restores_history(tmp_path: Path, monkeypatch) -> None:
+    _not_running(monkeypatch)
+    home = _dual_home(tmp_path)
+    (home / ".codelux").mkdir()
+    session_root = home / ".codex/sessions/2026/08/08"
+    session_root.mkdir(parents=True)
+    session = session_root / f"rollout-2026-08-08T00-00-00-{SESSION_ID}.jsonl"
+    session.write_text(
+        json.dumps(
+            {"type": "session_meta", "payload": {"id": SESSION_ID, "model_provider": "openai"}}
+        )
+        + "\n"
+    )
+    before = session.read_bytes()
+
+    def fail_after_first_write(self, change) -> None:
+        self._write(change.after[:1], ())
+        raise OSError("injected merge failure")
+
+    monkeypatch.setattr(CodexSessionManager, "commit", fail_after_first_write)
+    result = CliRunner().invoke(
+        main,
+        ["sessions", "merge", "--client", "codex"],
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+    assert result.exit_code != 0
+    assert "history was restored" in result.output
+    assert session.read_bytes() == before
+    assert not (home / ".codelux/recovery.json").exists()
+    assert not list((home / ".codelux/sync-transactions").glob("*/manifest.json"))
+
+
+def test_sessions_merge_rollback_failure_requires_recovery(tmp_path: Path, monkeypatch) -> None:
+    _not_running(monkeypatch)
+    home = _dual_home(tmp_path)
+    (home / ".codelux").mkdir()
+    session_root = home / ".codex/sessions/2026/08/08"
+    session_root.mkdir(parents=True)
+    session = session_root / f"rollout-2026-08-08T00-00-00-{SESSION_ID}.jsonl"
+    session.write_text(
+        json.dumps(
+            {"type": "session_meta", "payload": {"id": SESSION_ID, "model_provider": "openai"}}
+        )
+        + "\n"
+    )
+
+    def fail_after_first_write(self, change) -> None:
+        self._write(change.after[:1], ())
+        raise OSError("injected merge failure")
+
+    monkeypatch.setattr(CodexSessionManager, "commit", fail_after_first_write)
+    monkeypatch.setattr(
+        CodexSessionManager,
+        "rollback",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("injected rollback failure")),
+    )
+    result = CliRunner().invoke(
+        main,
+        ["sessions", "merge", "--client", "codex"],
+        env={"CODELUX_TEST_HOME": str(home)},
+    )
+    assert result.exit_code != 0
+    assert "recovery is required" in result.output
+    recovery = json.loads((home / ".codelux/recovery.json").read_text())
+    assert recovery["backup_directory"] == "sync-transactions"
+    store = SnapshotStore(home / ".codelux", "sync-transactions")
+    manifest = store.read_manifest(recovery["operation_id"])
+    assert manifest.operation_type == "sessions_merge"
+    assert manifest.state is OperationState.RECOVERY_REQUIRED
+    assert all(item.state is FileState.RECOVERY_REQUIRED for item in manifest.files)
 
 
 def test_single_client_failure_rolls_back_and_can_retry(tmp_path: Path, monkeypatch) -> None:

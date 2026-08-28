@@ -1,7 +1,8 @@
-"""Same-agent session sharing for Codex Provider switches."""
+"""Explicit same-agent session merging across Codex Providers."""
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 from collections.abc import Iterable
@@ -13,6 +14,10 @@ from codelux.models import ConfigFile, SessionChange
 from codelux.safe_files import atomic_write_private
 
 SHARED_PROVIDER = "custom"
+SESSION_ID_PATTERN = re.compile(
+    r"(?P<id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?=\.jsonl$)"
+)
 
 
 class CodexSessionManager:
@@ -24,31 +29,38 @@ class CodexSessionManager:
         self.sessions_root = self.root / "sessions"
         self.db_path = self.root / "state_5.sqlite"
 
-    def prepare(self, source_providers: Set[str]) -> Optional[SessionChange]:
-        source_providers = set(source_providers) - {SHARED_PROVIDER}
+    def prepare(self, source_providers: Optional[Set[str]] = None) -> Optional[SessionChange]:
+        """Prepare a reversible merge; None selects every non-shared Provider."""
+        if source_providers is not None:
+            source_providers = set(source_providers) - {SHARED_PROVIDER}
         json_changes = []
         if self.sessions_root.is_dir() and not self.sessions_root.is_symlink():
             for path in sorted(self.sessions_root.rglob("*.jsonl")):
                 if path.is_symlink() or not path.is_file():
                     raise ValidationError(f"unsafe Codex session file: {path}")
+                match = SESSION_ID_PATTERN.search(path.name)
+                if match is None:
+                    raise ValidationError(f"Codex session filename has no canonical UUID: {path}")
                 before = path.read_bytes()
-                after = self._rewrite_jsonl(before, source_providers)
+                after = self._rewrite_jsonl(before, source_providers, match.group("id"))
                 if after != before:
                     logical = "codex/" + str(path.relative_to(self.home / ".codex"))
+                    mode = path.stat().st_mode & 0o777
                     json_changes.append(
                         (
-                            ConfigFile(path, before, path.stat().st_mode & 0o777, logical),
-                            ConfigFile(path, after, 0o600, logical),
+                            ConfigFile(path, before, mode, logical),
+                            ConfigFile(path, after, mode, logical),
                         )
                     )
 
         db_before, db_after = self._rewrite_db(source_providers)
         changes = list(json_changes)
         if db_before is not None and db_after is not None and db_after != db_before:
+            mode = self.db_path.stat().st_mode & 0o777
             changes.append(
                 (
-                    ConfigFile(self.db_path, db_before, 0o600, "codex/state_5.sqlite"),
-                    ConfigFile(self.db_path, db_after, 0o600, "codex/state_5.sqlite"),
+                    ConfigFile(self.db_path, db_before, mode, "codex/state_5.sqlite"),
+                    ConfigFile(self.db_path, db_after, mode, "codex/state_5.sqlite"),
                 )
             )
         if not changes:
@@ -86,10 +98,12 @@ class CodexSessionManager:
             if item.path.is_symlink():
                 raise ValidationError(f"unsafe Codex session target: {item.path}")
             atomic_write_private(item.path, item.content, item.path.parent)
+            item.path.chmod(item.mode)
 
-    def _rewrite_jsonl(self, raw: bytes, sources: Set[str]) -> bytes:
+    def _rewrite_jsonl(self, raw: bytes, sources: Optional[Set[str]], canonical_id: str) -> bytes:
         lines = raw.splitlines(keepends=True)
         changed = False
+        matched = False
         output = []
         for line in lines:
             try:
@@ -100,8 +114,17 @@ class CodexSessionManager:
                 payload = item.get("payload")
                 if not isinstance(payload, dict):
                     raise ValidationError("Codex session metadata is invalid")
+                if payload.get("id") != canonical_id:
+                    output.append(line)
+                    continue
+                matched = True
                 provider = payload.get("model_provider")
-                if provider in sources:
+                selected = (
+                    isinstance(provider, str) and provider != SHARED_PROVIDER
+                    if sources is None
+                    else provider in sources
+                )
+                if selected:
                     payload["model_provider"] = SHARED_PROVIDER
                     newline = b"\n" if line.endswith(b"\n") else b""
                     line = (
@@ -111,9 +134,11 @@ class CodexSessionManager:
                         line = line.rstrip(b"\n")
                     changed = True
             output.append(line)
+        if not matched:
+            raise ValidationError("Codex session metadata does not match its filename")
         return b"".join(output) if changed else raw
 
-    def _rewrite_db(self, sources: Set[str]) -> tuple[Optional[bytes], Optional[bytes]]:
+    def _rewrite_db(self, sources: Optional[Set[str]]) -> tuple[Optional[bytes], Optional[bytes]]:
         if not self.db_path.is_file() or self.db_path.is_symlink():
             return None, None
         before = self._db_bytes(self.db_path)
@@ -128,8 +153,14 @@ class CodexSessionManager:
                 cols = target.execute("PRAGMA table_info(threads)").fetchall()
                 if not any(row[1] == "model_provider" for row in cols):
                     return before, before
-                placeholders = ",".join("?" for _ in sources)
-                if sources:
+                if sources is None:
+                    target.execute(
+                        "UPDATE threads SET model_provider = ? "
+                        "WHERE model_provider IS NOT NULL AND model_provider != ?",
+                        (SHARED_PROVIDER, SHARED_PROVIDER),
+                    )
+                elif sources:
+                    placeholders = ",".join("?" for _ in sources)
                     target.execute(
                         f"UPDATE threads SET model_provider = ? WHERE model_provider IN ({placeholders})",
                         (SHARED_PROVIDER, *sorted(sources)),

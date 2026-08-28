@@ -207,24 +207,29 @@ def test_codex_auth_and_internal_config_rollback_failure_requires_recovery(
         adapter.commit(change)
 
 
-def test_codex_session_commit_failure_restores_auth_and_config(tmp_path: Path, monkeypatch) -> None:
+def test_codex_provider_prepare_never_scans_session_history(tmp_path: Path, monkeypatch) -> None:
     config_dir = tmp_path / ".codex"
     config_dir.mkdir()
-    original_config = (
+    (config_dir / "config.toml").write_text(
         'model_provider = "proxy"\n\n'
         "[model_providers.proxy]\n"
         'base_url = "https://old.example"\n'
         'wire_api = "responses"\n'
         "requires_openai_auth = true\n"
     )
-    original_auth = json.dumps({"OPENAI_API_KEY": "old-secret", "auth_mode": "apikey"})
-    (config_dir / "config.toml").write_text(original_config)
-    (config_dir / "auth.json").write_text(original_auth)
+    (config_dir / "auth.json").write_text(
+        json.dumps({"OPENAI_API_KEY": "old-secret", "auth_mode": "apikey"})
+    )
     sessions = config_dir / "sessions" / "2026" / "08" / "08"
     sessions.mkdir(parents=True)
     (sessions / "session.jsonl").write_text(
         json.dumps({"type": "session_meta", "payload": {"id": "sid", "model_provider": "openai"}})
         + "\n"
+    )
+    monkeypatch.setattr(
+        codex_module.CodexSessionManager,
+        "prepare",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("history was scanned")),
     )
     adapter = CodexAdapter(tmp_path, _registry())
     change = adapter.prepare_provider(
@@ -236,21 +241,7 @@ def test_codex_session_commit_failure_restores_auth_and_config(tmp_path: Path, m
             "requires_openai_auth": True,
         }
     )
-    assert change.session is not None
-
-    import codelux.adapters.codex as module
-
-    real_session_commit = module.CodexSessionManager.commit
-    monkeypatch.setattr(
-        module.CodexSessionManager,
-        "commit",
-        lambda self, session: (_ for _ in ()).throw(OSError("injected session failure")),
-    )
-    with pytest.raises(OSError, match="injected session failure"):
-        adapter.commit(change)
-    assert (config_dir / "config.toml").read_text() == original_config
-    assert (config_dir / "auth.json").read_text() == original_auth
-    monkeypatch.setattr(module.CodexSessionManager, "commit", real_session_commit)
+    assert change.session is None
 
 
 @pytest.mark.parametrize(
