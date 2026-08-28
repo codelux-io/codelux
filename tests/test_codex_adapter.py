@@ -271,6 +271,23 @@ def test_codex_official_states(
     assert CodexAdapter(tmp_path).inspect().state is expected
 
 
+def test_registered_custom_key_without_routing_is_not_official_api_key(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config_dir = tmp_path / ".codex"
+    config_dir.mkdir()
+    (config_dir / "config.toml").write_text('model = "gpt"\n')
+    (config_dir / "auth.json").write_text(
+        json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "new-secret"})
+    )
+
+    observed = CodexAdapter(tmp_path, _registry()).inspect()
+
+    assert observed.state is ConfigState.UNKNOWN
+    assert observed.reasons == ("registered Provider key is missing its routing",)
+
+
 def test_codex_official_login_defaults_to_openai_without_selector(
     tmp_path: Path, monkeypatch
 ) -> None:

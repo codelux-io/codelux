@@ -62,7 +62,7 @@ def _home(tmp_path: Path) -> Path:
 
 
 def _latest_operation(home: Path):
-    store = SnapshotStore(home / ".codelux")
+    store = SnapshotStore(home / ".codelux", "sync-transactions")
     operation_ids = [path.name for path in store.backups.iterdir() if path.is_dir()]
     assert len(operation_ids) == 1
     return store, store.read_manifest(operation_ids[0])
@@ -512,6 +512,63 @@ def test_user_environment_conflicts_require_user_environment_overwrite_scope(
     assert (target / ".codex/config.toml").read_text() == 'model = "source"\n'
 
 
+def test_user_environment_merge_preserves_target_codex_routing(tmp_path: Path) -> None:
+    source = _home(tmp_path / "source")
+    target = _home(tmp_path / "target")
+    (source / ".codex/config.toml").write_text(
+        'model = "source-model"\n[features]\nweb_search = true\n'
+    )
+    target_config = target / ".codex/config.toml"
+    target_config.write_text(
+        'model_provider = "custom"\nmodel = "target-model"\n\n'
+        '[model_providers.custom]\nname = "codelux-io"\n'
+        'base_url = "https://codelux.example"\nwire_api = "responses"\n'
+        "requires_openai_auth = true\n\n"
+        '[projects."/target"]\ntrust_level = "trusted"\n'
+    )
+    auth = target / ".codex/auth.json"
+    auth.write_text('{"auth_mode":"apikey","OPENAI_API_KEY":"custom-key"}\n')
+    before_auth = auth.read_bytes()
+    manifest, files = build_manifest(source, ["user_env"])
+    manifest, payload = materialize_sync_files(manifest, files)
+
+    apply_import(target, manifest, payload, overwrite={"user_env": True})
+
+    merged = target_config.read_text()
+    assert 'model_provider = "custom"' in merged
+    assert "[model_providers.custom]" in merged
+    assert 'base_url = "https://codelux.example"' in merged
+    assert '[projects."/target"]' in merged
+    assert 'trust_level = "trusted"' in merged
+    assert 'model = "source-model"' in merged
+    assert 'model = "target-model"' not in merged
+    assert "[features]" in merged and "web_search = true" in merged
+    assert auth.read_bytes() == before_auth
+    transactions = target / ".codelux/sync-transactions"
+    assert not transactions.exists() or not any(transactions.iterdir())
+
+
+def test_sync_transaction_excludes_unchanged_session_payload(tmp_path: Path, monkeypatch) -> None:
+    source = _home(tmp_path / "source")
+    target = _home(tmp_path / "target")
+    source_session = source / ".codex/sessions/2026/08/28/session.jsonl"
+    target_session = target / ".codex/sessions/2026/08/28/session.jsonl"
+    source_session.parent.mkdir(parents=True)
+    target_session.parent.mkdir(parents=True)
+    content = b'{"type":"session_meta","payload":{"model_provider":"custom"}}\n'
+    source_session.write_bytes(content)
+    target_session.write_bytes(content)
+    manifest, files = build_manifest(source, ["sessions"], clients=("codex",))
+    manifest, payload = materialize_sync_files(manifest, files)
+    monkeypatch.setattr(SnapshotStore, "discard", lambda self, operation: None)
+
+    apply_import(target, manifest, payload, overwrite={"codex": True})
+
+    store, operation = _latest_operation(target)
+    assert {item.source_path for item in operation.files} == {"codelux/sync-state.json"}
+    assert sum((store.root / item.backup_path).stat().st_size for item in operation.files) < 4096
+
+
 def test_project_environment_conflicts_require_project_environment_overwrite_scope(
     tmp_path: Path,
 ) -> None:
@@ -590,7 +647,7 @@ def test_agent_environment_sanitizers_remove_routing_trust_and_secrets() -> None
         sync_module._sanitize_json_environment(b"not-json", strip_claude_routing=False)
 
 
-def test_project_environment_and_memory_apply_to_mapped_target(tmp_path: Path) -> None:
+def test_project_environment_and_memory_apply_to_mapped_target(tmp_path: Path, monkeypatch) -> None:
     source_home = _home(tmp_path / "source-home")
     source_project = tmp_path / "source-project"
     source_project.mkdir()
@@ -607,6 +664,7 @@ def test_project_environment_and_memory_apply_to_mapped_target(tmp_path: Path) -
         source_home, ["project_env", "memory"], project_roots=(source_project,)
     )
     manifest, payload = materialize_sync_files(manifest, sources)
+    monkeypatch.setattr(SnapshotStore, "discard", lambda self, manifest: None)
 
     target_home = _home(tmp_path / "target-home")
     target_project = tmp_path / "target-project"
@@ -634,7 +692,7 @@ def test_project_environment_and_memory_apply_to_mapped_target(tmp_path: Path) -
     with pytest.raises(ValueError, match="target must be absolute"):
         replace(operation, target_roots={project_id: "relative"})
 
-    store = SnapshotStore(target_home / ".codelux")
+    store = SnapshotStore(target_home / ".codelux", "sync-transactions")
     recovery = replace(
         operation,
         files=tuple(replace(item, state=FileState.RECOVERY_REQUIRED) for item in operation.files),
@@ -1398,7 +1456,7 @@ def test_import_backup_failure_is_controlled_and_does_not_touch_target(
     real_write = sync_module.atomic_write_private
 
     def fail_backup(path, content, root, validator=None):
-        if "backups" in path.parts and path.name == "settings.json":
+        if "sync-transactions" in path.parts and path.name == "settings.json":
             raise OSError("injected backup failure")
         return real_write(path, content, root, validator)
 
@@ -1614,7 +1672,7 @@ def test_import_baseline_conflict_decision_matrix(
             apply_import(target, manifest, payload, overwrite=overwrite)
         assert target_settings.read_bytes() == target_before
         assert (baseline_path.read_bytes() if baseline_path.exists() else None) == baseline_before
-        backups = target / ".codelux/backups"
+        backups = target / ".codelux/sync-transactions"
         assert not backups.exists() or not any(backups.iterdir())
         assert not (target / ".codelux/recovery.json").exists()
         return
@@ -1628,9 +1686,9 @@ def test_import_baseline_conflict_decision_matrix(
         state["baselines"][key]["files"]["claude/settings.json"]
         == hashlib.sha256(incoming).hexdigest()
     )
-    store, operation = _latest_operation(target)
-    assert operation.state is OperationState.COMMITTED
-    assert not (store.root / "recovery.json").exists()
+    transactions = target / ".codelux/sync-transactions"
+    assert not transactions.exists() or not any(transactions.iterdir())
+    assert not (target / ".codelux/recovery.json").exists()
 
 
 def test_reset_baseline_restores_first_sync_conflict_protection(tmp_path: Path) -> None:
