@@ -489,9 +489,9 @@ def test_switch_official_recovers_login_snapshot_mislabeled_unknown(
 
     switched_custom = runner.invoke(main, ["switch", "codelux", "--client", "codex"], env=env)
     assert switched_custom.exit_code == 0, switched_custom.output
-    assert json.loads(session_file.read_text())["payload"]["model_provider"] == "custom"
+    assert json.loads(session_file.read_text())["payload"]["model_provider"] == "openai"
     with sqlite3.connect(state_db) as conn:
-        assert conn.execute("select model_provider from threads").fetchone()[0] == "custom"
+        assert conn.execute("select model_provider from threads").fetchone()[0] == "openai"
     manifest_paths = list((root / "backups").glob("*/manifest.json"))
     assert len(manifest_paths) == 1
     manifest = json.loads(manifest_paths[0].read_text())
@@ -507,9 +507,9 @@ def test_switch_official_recovers_login_snapshot_mislabeled_unknown(
     assert 'name = "OpenAI"' in custom_section
     assert "base_url" not in custom_section
     assert json.loads((codex_dir / "auth.json").read_text())["auth_mode"] == "chatgpt"
-    assert json.loads(session_file.read_text())["payload"]["model_provider"] == "custom"
+    assert json.loads(session_file.read_text())["payload"]["model_provider"] == "openai"
     with sqlite3.connect(state_db) as conn:
-        assert conn.execute("select model_provider from threads").fetchone()[0] == "custom"
+        assert conn.execute("select model_provider from threads").fetchone()[0] == "openai"
     assert CodexAdapter(home).inspect().state is ConfigState.OFFICIAL_LOGIN
 
     switched_custom_again = runner.invoke(main, ["switch", "codelux", "--client", "codex"], env=env)
@@ -520,9 +520,9 @@ def test_switch_official_recovers_login_snapshot_mislabeled_unknown(
     assert 'name = "codelux"' in custom_section
     assert 'base_url = "https://codelux.example"' in custom_section
     assert json.loads((codex_dir / "auth.json").read_text())["auth_mode"] == "apikey"
-    assert json.loads(session_file.read_text())["payload"]["model_provider"] == "custom"
+    assert json.loads(session_file.read_text())["payload"]["model_provider"] == "openai"
     with sqlite3.connect(state_db) as conn:
-        assert conn.execute("select model_provider from threads").fetchone()[0] == "custom"
+        assert conn.execute("select model_provider from threads").fetchone()[0] == "openai"
 
 
 def test_switch_official_without_snapshot_explains_claude_login(
@@ -650,7 +650,16 @@ def test_status_without_client_lists_all_installed_clients(tmp_path: Path) -> No
 def test_provider_command_inventory_is_minimal() -> None:
     result = CliRunner().invoke(main, ["--help"])
     assert result.exit_code == 0, result.output
-    for command in ("add", "list", "recover", "remove", "status", "switch", "update"):
+    for command in (
+        "add",
+        "list",
+        "recover",
+        "remove",
+        "sessions",
+        "status",
+        "switch",
+        "update",
+    ):
         assert command in result.output
     for removed in ("config", "edit", "reconcile", "rename"):
         assert f"  {removed} " not in result.output

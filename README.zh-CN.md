@@ -92,6 +92,21 @@ codelux add codelux-io --url https://codelux.io --client claude
 codelux switch codelux-io --client codex
 ```
 
+普通 Provider 切换只更新路由和认证配置，不扫描或改写已有 Codex 会话历史。默认情况下，未来
+创建的 Codex 会话使用共享的 `custom` Provider 别名，因此切换 Provider 后仍然可见。如需让未来
+会话继续保留彼此分离的 Provider 标识，可使用 `--no-shared-session`。
+
+如需整合分布在不同 Provider 下的同一 Codex Agent 历史会话，请先停止 Codex，再显式执行合并：
+
+```bash
+codelux sessions merge --client codex
+```
+
+该命令会把历史中所有非 `custom` Provider 标识改为共享的 `custom` 别名，包括已经删除或无法识别
+的旧 Provider。处理时间可能随会话历史大小增长；当前 Provider、凭据和 Registry 均不会改变。
+只有实际变化的历史文件会暂存在 `~/.codelux/sync-transactions` 以便回滚，合并成功后会删除临时
+payload。
+
 将 Claude Code 恢复到官方配置或官方登录流程：
 
 ```bash

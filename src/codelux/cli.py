@@ -23,6 +23,7 @@ from codelux.models import (
     HealthState,
     Manifest,
     OperationState,
+    PreparedChange,
     ProcessState,
 )
 from codelux.registry import (
@@ -34,6 +35,7 @@ from codelux.registry import (
 )
 from codelux.registry_io import load_registry, save_registry
 from codelux.safe_files import atomic_write_private
+from codelux.sessions import CodexSessionManager
 from codelux.snapshots import SnapshotStore
 from codelux.sync import (
     OVERWRITE_SCOPES,
@@ -113,6 +115,11 @@ def version() -> None:
 @main.group(name="sync")
 def sync_group() -> None:
     """Synchronize selected state between isolated Codelux homes."""
+
+
+@main.group(name="sessions")
+def sessions_group() -> None:
+    """Manage same-agent session history across Providers."""
 
 
 def _sync_selection(
@@ -1673,6 +1680,71 @@ def _adapters() -> tuple:
     )
 
 
+@sessions_group.command(name="merge")
+@click.option("--client", type=click.Choice(["codex"]), required=True)
+@_locked
+def sessions_merge(client: str) -> None:
+    """Merge same-agent session history across Providers."""
+    try:
+        adapters, registry, root = _adapters()
+        target = _resolve_client(client, adapters)[0]
+        adapter = adapters[target]
+        if adapter.is_running() is not ProcessState.NOT_RUNNING:
+            raise ValidationError(f"{target} is running or process state is unknown")
+
+        manager = CodexSessionManager(_home())
+        session = manager.prepare()
+        if session is None:
+            click.echo("Codex sessions are already merged across Providers")
+            return
+
+        store = SnapshotStore(root, "sync-transactions")
+        store.prune_finalized()
+        change = PreparedChange(target, (), (), adapter.inspect(), session)
+        manifest = store.create(
+            (change,),
+            "sessions_merge",
+            "shared:custom",
+            {target: registry.current.get(target)},
+        )
+        try:
+            manifest = store.set_operation_state(manifest, OperationState.COMMITTING)
+            # Persist recovery intent before the first history write. The
+            # manager may update many files before a later write fails.
+            manifest = store.update_all_file_states(manifest, FileState.MODIFIED)
+            manager.commit(session)
+            manifest = store.set_operation_state(manifest, OperationState.COMMITTED)
+        except Exception as exc:
+            try:
+                manager.rollback(session)
+                manifest = store.update_all_file_states(manifest, FileState.ROLLED_BACK)
+                manifest = store.set_operation_state(manifest, OperationState.ROLLED_BACK)
+                try:
+                    store.discard(manifest)
+                except (OSError, ValidationError):
+                    pass
+            except Exception as rollback_exc:
+                try:
+                    store.require_recovery(manifest)
+                except Exception as recovery_exc:
+                    raise RecoveryRequiredError(
+                        "Codex session merge failed and recovery state could not be persisted"
+                    ) from recovery_exc
+                raise RecoveryRequiredError(
+                    "Codex session merge failed and recovery is required"
+                ) from rollback_exc
+            raise ValidationError("Codex session merge failed; history was restored") from exc
+        try:
+            store.discard(manifest)
+        except (OSError, ValidationError):
+            # The committed merge is authoritative. A later temporary-store
+            # operation will prune the finalized rollback payload.
+            pass
+        click.echo("Merged Codex sessions across Providers")
+    except CodeluxError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _resolve_client(requested: str, adapters: dict) -> list:
     installed = [name for name, adapter in adapters.items() if adapter.is_installed()]
     if requested:
@@ -1932,11 +2004,7 @@ def update_provider(name: str, client: str, url: Optional[str], key_stdin: bool)
         if active:
             payload = bindings[target].to_dict()
             payload["provider_id"] = name
-            change = (
-                adapters[target].prepare_provider(payload, migrate_sessions=False)
-                if target == "codex"
-                else adapters[target].prepare_provider(payload)
-            )
+            change = adapters[target].prepare_provider(payload)
             store = SnapshotStore(root)
             manifest = store.create(
                 (change,), "update", name, {target: registry.desired.get(target)}
@@ -2012,7 +2080,7 @@ def remove_provider(name: str, client: str, force: bool) -> None:
 @click.option(
     "--no-shared-session",
     is_flag=True,
-    help="Keep same-agent Codex sessions separated by Provider.",
+    help="Route future Codex sessions separately by Provider.",
 )
 @_locked
 def switch(name: str, client: str, no_shared_session: bool) -> None:
@@ -2024,7 +2092,6 @@ def switch(name: str, client: str, no_shared_session: bool) -> None:
             store = SnapshotStore(root)
             changes = []
             native_login_targets = []
-            session_sources = set(registry.providers) | {"openai", "custom"}
             for target in names:
                 if adapters[target].is_running() is not ProcessState.NOT_RUNNING:
                     raise ValidationError(f"{target} is running or process state is unknown")
@@ -2043,7 +2110,6 @@ def switch(name: str, client: str, no_shared_session: bool) -> None:
                     changes.append(
                         adapters[target].prepare_native_official_restore(
                             shared_session=not no_shared_session,
-                            session_sources=session_sources,
                         )
                     )
                     continue
@@ -2065,7 +2131,6 @@ def switch(name: str, client: str, no_shared_session: bool) -> None:
                         adapters[target].prepare_snapshot_restore(
                             manifest.to_dict(),
                             shared_session=not no_shared_session,
-                            session_sources=session_sources,
                         )
                     )
                 else:
@@ -2102,7 +2167,6 @@ def switch(name: str, client: str, no_shared_session: bool) -> None:
         if provider is None:
             raise ValidationError(f"unknown Provider: {name}")
         changes = []
-        session_sources = set(registry.providers) | {"openai"}
         for target in names:
             binding = provider.clients.get(target)
             if binding is None or not binding.enabled:
@@ -2123,7 +2187,6 @@ def switch(name: str, client: str, no_shared_session: bool) -> None:
                     adapters[target].prepare_provider(
                         payload,
                         shared_session=not no_shared_session,
-                        session_sources=session_sources,
                     )
                 )
             else:
