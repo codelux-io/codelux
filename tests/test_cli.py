@@ -12,7 +12,9 @@ from codelux.adapters.claude import ClaudeAdapter
 from codelux.adapters.codex import CodexAdapter
 from codelux.cli import main
 from codelux.errors import ValidationError
-from codelux.models import ConfigState, ObservedConfig, ProcessState
+from codelux.models import ConfigFile, ConfigState, ObservedConfig, PreparedChange, ProcessState
+from codelux.registry import ClientBinding, ProviderRecord, Registry
+from codelux.registry_io import load_registry
 from codelux.snapshots import SnapshotStore
 from codelux.sync import (
     _claude_project_slug,
@@ -338,6 +340,88 @@ def test_switch_official_is_noop_after_native_codex_login(tmp_path: Path, monkey
     )
     assert result.exit_code == 0, result.output
     assert result.output == "codex is already using the official configuration\n"
+
+
+def test_official_snapshot_selection_prefers_chatgpt_login_over_newer_api_key(
+    tmp_path: Path,
+) -> None:
+    home = _claude_home(tmp_path)
+    root = home / ".codelux"
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(exist_ok=True)
+    config = codex_dir / "config.toml"
+    auth = codex_dir / "auth.json"
+    store = SnapshotStore(root)
+
+    login = PreparedChange(
+        "codex",
+        (
+            ConfigFile(config, b'model_provider = "openai"\n', 0o600),
+            ConfigFile(
+                auth,
+                json.dumps(
+                    {"auth_mode": "chatgpt", "tokens": {"access_token": "login-token"}}
+                ).encode(),
+                0o600,
+            ),
+        ),
+        (),
+        ObservedConfig(ConfigState.OFFICIAL_LOGIN, "openai", None, None),
+    )
+    login_manifest = store.create((login,), "switch", "custom", {"codex": None})
+    api_key = PreparedChange(
+        "codex",
+        (
+            ConfigFile(config, b'model_provider = "openai"\n', 0o600),
+            ConfigFile(
+                auth,
+                json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "official-key"}).encode(),
+                0o600,
+            ),
+        ),
+        (),
+        ObservedConfig(ConfigState.OFFICIAL_API_KEY, "openai", None, None),
+    )
+    store.create((api_key,), "switch", "custom", {"codex": None})
+
+    selected = cli_module._latest_official_manifest(store, "codex", load_registry(root))
+
+    assert selected.operation_id == login_manifest.operation_id
+
+
+def test_official_snapshot_selection_rejects_registered_custom_key(tmp_path: Path) -> None:
+    home = _claude_home(tmp_path)
+    root = home / ".codelux"
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(exist_ok=True)
+    config = codex_dir / "config.toml"
+    auth = codex_dir / "auth.json"
+    store = SnapshotStore(root)
+    false_official = PreparedChange(
+        "codex",
+        (
+            ConfigFile(config, b'model = "gpt"\n', 0o600),
+            ConfigFile(
+                auth,
+                json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "custom-key"}).encode(),
+                0o600,
+            ),
+        ),
+        (),
+        ObservedConfig(ConfigState.OFFICIAL_API_KEY, "openai", None, None),
+    )
+    store.create((false_official,), "switch", "custom", {"codex": None})
+    registry = Registry(
+        providers={
+            "custom": ProviderRecord(
+                "custom",
+                {"codex": ClientBinding("https://codelux.example", "custom-key")},
+            )
+        }
+    )
+
+    with pytest.raises(ValidationError, match="no verified official snapshot"):
+        cli_module._latest_official_manifest(store, "codex", registry)
 
 
 def test_switch_official_recovers_login_snapshot_mislabeled_unknown(
@@ -1738,9 +1822,8 @@ def test_sync_pull_applies_remote_provider_archive(tmp_path: Path, monkeypatch) 
         "--providers",
         "--keys",
     ]
-    store = SnapshotStore(target / ".codelux")
-    operation_id = next(path.name for path in store.backups.iterdir() if path.is_dir())
-    assert store.read_manifest(operation_id).operation_type == "sync_pull"
+    transactions = target / ".codelux/sync-transactions"
+    assert not transactions.exists() or not any(transactions.iterdir())
 
 
 def test_sync_pull_maps_claude_history_to_local_project(tmp_path: Path, monkeypatch) -> None:
@@ -1773,7 +1856,7 @@ def test_sync_pull_maps_claude_history_to_local_project(tmp_path: Path, monkeypa
     assert json.loads((mapped / "session.jsonl").read_text())["cwd"] == str(local_project)
 
 
-def test_sync_transport_receive_records_push_operation(tmp_path: Path) -> None:
+def test_sync_transport_receive_cleans_up_push_transaction(tmp_path: Path) -> None:
     source = tmp_path / "source"
     target = tmp_path / "target"
     for home in (source, target):
@@ -1792,9 +1875,8 @@ def test_sync_transport_receive_records_push_operation(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    store = SnapshotStore(target / ".codelux")
-    operation_id = next(path.name for path in store.backups.iterdir() if path.is_dir())
-    assert store.read_manifest(operation_id).operation_type == "sync_push"
+    transactions = target / ".codelux/sync-transactions"
+    assert not transactions.exists() or not any(transactions.iterdir())
 
 
 def test_sync_transport_receive_protocol_two_preflights_then_commits(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 import uuid
 from collections.abc import Mapping
 from dataclasses import replace
@@ -23,9 +24,11 @@ from codelux.safe_files import atomic_write_private, ensure_private_dir
 
 
 class SnapshotStore:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, backup_directory: str = "backups") -> None:
+        if backup_directory not in {"backups", "sync-transactions"}:
+            raise ValidationError("snapshot backup directory is invalid")
         self.root = root.absolute()
-        self.backups = self.root / "backups"
+        self.backups = self.root / backup_directory
 
     def create(
         self,
@@ -94,11 +97,18 @@ class SnapshotStore:
         atomic_write_private(operation_dir / "manifest.json", payload, self.root)
 
     def read_manifest(self, operation_id: str) -> Manifest:
+        manifest = self.read_manifest_metadata(operation_id)
+        self.validate_manifest(manifest)
+        return manifest
+
+    def read_manifest_metadata(self, operation_id: str) -> Manifest:
+        """Read one manifest without hashing its rollback payload."""
         path = self.backups / operation_id / "manifest.json"
         try:
             raw = json.loads(path.read_bytes())
             manifest = Manifest.from_dict(raw)
-            self.validate_manifest(manifest)
+            if manifest.operation_id != operation_id:
+                raise ValueError("operation id mismatch")
             return manifest
         except (
             OSError,
@@ -118,7 +128,7 @@ class SnapshotStore:
             if not operation_dir.is_dir() or operation_dir.is_symlink():
                 continue
             try:
-                manifest = self.read_manifest(operation_dir.name)
+                manifest = self.read_manifest_metadata(operation_dir.name)
             except ValidationError:
                 continue
             if manifest.state not in {OperationState.COMMITTED, OperationState.ROLLED_BACK}:
@@ -188,7 +198,8 @@ class SnapshotStore:
     def write_recovery(self, manifest: Manifest) -> None:
         payload = {
             "operation_id": manifest.operation_id,
-            "manifest": f"backups/{manifest.operation_id}/manifest.json",
+            "manifest": f"{self.backups.name}/{manifest.operation_id}/manifest.json",
+            "backup_directory": self.backups.name,
             "state": OperationState.RECOVERY_REQUIRED.value,
             "files": [
                 file.source_path
@@ -201,6 +212,29 @@ class SnapshotStore:
             (json.dumps(payload, ensure_ascii=True, indent=2) + "\n").encode(),
             self.root,
         )
+
+    def discard(self, manifest: Manifest) -> None:
+        """Remove a finalized temporary transaction payload."""
+        if manifest.state not in {OperationState.COMMITTED, OperationState.ROLLED_BACK}:
+            raise ValidationError("active snapshot transaction cannot be discarded")
+        operation_dir = self.backups / manifest.operation_id
+        if operation_dir.is_symlink() or not operation_dir.is_dir():
+            raise ValidationError("snapshot operation directory is missing or unsafe")
+        shutil.rmtree(operation_dir)
+
+    def prune_finalized(self) -> None:
+        """Remove finalized transactions from a temporary transaction store."""
+        if self.backups.name != "sync-transactions" or not self.backups.is_dir():
+            return
+        for operation_dir in self.backups.iterdir():
+            if not operation_dir.is_dir() or operation_dir.is_symlink():
+                continue
+            try:
+                manifest = self.read_manifest_metadata(operation_dir.name)
+                if manifest.state in {OperationState.COMMITTED, OperationState.ROLLED_BACK}:
+                    self.discard(manifest)
+            except (OSError, ValidationError):
+                continue
 
     def recover(self, home: Path, operation_id: str) -> Manifest:
         recovery_path = self.root / "recovery.json"

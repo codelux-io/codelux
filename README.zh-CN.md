@@ -173,6 +173,15 @@ ID，并使用 `--target-project PROJECT_ID=TARGET` 指定目标。
 已识别的令牌前缀，整个参数数组都会被清空，需要在目标机器重新配置该命令。自由格式的
 指令和命令仍可能包含私密内容，因此传输前应审查所选文件，并使用加密导出或可信 SSH 对端。
 
+导入 Codex 用户设置时会进行合并：可移植设置可以传输，但目标机器会保留当前 Provider 路由和
+trust 条目。Provider/配置快照继续存放在 `~/.codelux/backups`；会话历史和其他传输 payload 的
+回滚数据则使用独立的 `~/.codelux/sync-transactions`，只暂存实际会变化的文件，并在传输成功后
+删除临时回滚 payload。正常的状态和切换命令只读取轻量 manifest 元数据，不再扫描并校验存储的
+payload 文件。
+
+将 Codex 切回 `official` 时，有效的 ChatGPT 登录快照优先于 API key 快照。如果某个 key 已注册
+给自定义 Provider，即使它的路由条目缺失，也不会仅因此被分类为官方 OpenAI API key。
+
 `--memory` 范围包含所选项目的 Claude Markdown 自动记忆，以及 `~/.codex/memories` 下完整的
 Codex 生成记忆；传输前应审查生成内容。同步会遵循 `CLAUDE_CONFIG_DIR` 和
 `CLAUDE_CODE_PROJECT_DIR_NAME`。任意 `autoMemoryDirectory` 外部路径、所选项目之外的绝对路径或

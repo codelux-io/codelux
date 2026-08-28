@@ -182,6 +182,17 @@ array is cleared in full when it contains a credential flag or recognized token 
 that command on the target. Free-form instructions and commands can still contain private material,
 so review selected files and use an encrypted export or a trusted SSH peer.
 
+Codex user settings are merged on import: portable settings may be transferred, while the target
+machine keeps its active Provider routing and trust entries. Provider/configuration snapshots remain
+under `~/.codelux/backups`. Session history and other transferred payloads use the separate
+`~/.codelux/sync-transactions` rollback area; only files that would actually change are staged, and a
+successful transfer removes its temporary rollback payload. Normal status and switching commands read
+lightweight manifest metadata instead of hashing stored payload files.
+
+When returning Codex to `official`, a valid ChatGPT login snapshot takes precedence over an API-key
+snapshot. A key registered to a custom Provider is not classified as an official OpenAI API key merely
+because its routing entry is missing.
+
 The `--memory` scope contains the selected projects' Claude Markdown auto memory and the complete
 generated Codex memory tree under `~/.codex/memories`; review generated memory before transfer.
 `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_PROJECT_DIR_NAME` are honored by synchronization. Arbitrary

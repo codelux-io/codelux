@@ -1196,7 +1196,47 @@ def _sanitize_codex_user_config(content: bytes) -> bytes:
         if re.match(r"^(model_provider|openai_base_url|chatgpt_base_url)\s*=", stripped):
             continue
         result.append(line)
-    return "".join(result).encode()
+    sanitized = "".join(result).encode()
+    if sanitized and not sanitized.endswith(b"\n"):
+        sanitized += b"\n"
+    return sanitized
+
+
+def _codex_routing_fragments(content: bytes) -> tuple[bytes, bytes]:
+    """Extract target-owned routing without carrying other user settings."""
+    try:
+        lines = content.decode().splitlines(keepends=True)
+    except UnicodeDecodeError as exc:
+        raise ValidationError("Codex user configuration is invalid") from exc
+    root_lines = []
+    table_lines = []
+    routing_table = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            routing_table = stripped.startswith(
+                ("[model_providers.", "[projects.", "[mcp_servers.")
+            ) or stripped in {"[model_providers]", "[projects]", "[mcp_servers]"}
+        if routing_table:
+            table_lines.append(line)
+        elif re.match(r"^(model_provider|openai_base_url|chatgpt_base_url)\s*=", stripped):
+            root_lines.append(line if line.endswith(("\n", "\r")) else line + "\n")
+    return "".join(root_lines).encode(), "".join(table_lines).encode()
+
+
+def _merge_codex_user_config(target: Path, incoming: bytes) -> bytes:
+    """Apply portable Codex settings while retaining target routing and trust."""
+    portable = _sanitize_codex_user_config(incoming)
+    if not target.is_file():
+        return portable
+    routing_root, routing_tables = _codex_routing_fragments(target.read_bytes())
+    return routing_root + portable + routing_tables
+
+
+def _sync_baseline_content(logical_path: str, content: bytes) -> bytes:
+    if logical_path == "user-env/codex/config.toml":
+        return _sanitize_codex_user_config(content)
+    return content
 
 
 def _sanitize_json_environment(content: bytes, *, strip_claude_routing: bool) -> bytes:
@@ -1655,16 +1695,22 @@ def apply_import(
         incoming = files[entry.path]
         before = target.read_bytes() if target.is_file() else None
         compare_before = before
+        compare_incoming = incoming
         provider_merge = entry.path == "codelux/providers.json"
         if provider_merge:
             incoming = _merge_provider_registry(target, incoming, allows(entry.path))
         local_mcp_merge = entry.path == "project-local-mcp.json"
         if local_mcp_merge:
             incoming = _merge_claude_local_mcp(target, incoming, target_roots, allows(entry.path))
+        codex_user_config_merge = entry.path == "user-env/codex/config.toml"
+        if codex_user_config_merge:
+            compare_before = _sanitize_codex_user_config(before) if before is not None else None
+            compare_incoming = _sanitize_codex_user_config(incoming)
+            incoming = _merge_codex_user_config(target, incoming)
         current_hash = (
             hashlib.sha256(compare_before).hexdigest() if compare_before is not None else None
         )
-        incoming_hash = entry.sha256
+        incoming_hash = hashlib.sha256(compare_incoming).hexdigest()
         old_hash = baseline_files.get(entry.path)
         if before is None:
             if old_hash is not None:
@@ -1695,7 +1741,10 @@ def apply_import(
     baseline_target = _state_path(root)
     baseline_before = baseline_target.read_bytes() if baseline_target.is_file() else None
     applied_hashes = {
-        item.logical_path: hashlib.sha256(item.incoming).hexdigest() for item in prepared
+        item.logical_path: hashlib.sha256(
+            _sync_baseline_content(item.logical_path, item.incoming)
+        ).hexdigest()
+        for item in prepared
     }
     prepared.append(
         _PreparedWrite(
@@ -1708,13 +1757,18 @@ def apply_import(
         )
     )
 
+    changed = [item for item in prepared if item.before != item.incoming]
+    if not changed:
+        return tuple(missing)
+
     operation_id = uuid.uuid4().hex
-    store = SnapshotStore(root)
+    store = SnapshotStore(root, "sync-transactions")
+    store.prune_finalized()
     operation_dir = store.backups / operation_id
     try:
         ensure_private_dir(operation_dir)
         manifest_files = []
-        for item in prepared:
+        for item in changed:
             backup = operation_dir / item.logical_path
             ensure_private_dir(backup.parent)
             backup_content = item.before if item.before is not None else b""
@@ -1751,9 +1805,7 @@ def apply_import(
     modified: list[int] = []
     try:
         operation = store.set_operation_state(operation, OperationState.COMMITTING)
-        for index, item in enumerate(prepared):
-            if item.before == item.incoming:
-                continue
+        for index, item in enumerate(changed):
             # Persist the recovery intent before touching the target. Restoring an
             # unchanged file is harmless; omitting a file changed before a later
             # chmod/hash failure is not.
@@ -1772,10 +1824,16 @@ def apply_import(
             if item.target.stat().st_mode & 0o777 != item.target_mode:
                 raise ValidationError("sync target mode mismatch after write")
         operation = store.set_operation_state(operation, OperationState.COMMITTED)
+        try:
+            store.discard(operation)
+        except (OSError, ValidationError):
+            # A committed transfer is authoritative. A later sync prunes any
+            # finalized temporary transaction that could not be removed now.
+            pass
     except Exception as exc:
         recovery_failed = False
         for index in reversed(modified):
-            item = prepared[index]
+            item = changed[index]
             try:
                 if item.before is None:
                     if item.target.exists():

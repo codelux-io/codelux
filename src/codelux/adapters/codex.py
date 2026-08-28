@@ -120,6 +120,20 @@ class CodexAdapter(ClientAdapter):
                 ConfigState.UNKNOWN, provider_id, None, None, ("auth mode invalid",)
             )
         if provider_id == "openai":
+            registered_match = self.registry is not None and any(
+                binding.api_key == api_key
+                for record in self.registry.providers.values()
+                for client, binding in record.clients.items()
+                if client == "codex"
+            )
+            if registered_match:
+                return ObservedConfig(
+                    ConfigState.UNKNOWN,
+                    "openai",
+                    None,
+                    None,
+                    ("registered Provider key is missing its routing",),
+                )
             return ObservedConfig(
                 ConfigState.OFFICIAL_API_KEY,
                 "openai",

@@ -80,6 +80,21 @@ class ProviderListRow(TypedDict):
     builtin: bool
 
 
+def _snapshot_stores(root: Path) -> tuple[SnapshotStore, SnapshotStore]:
+    return SnapshotStore(root), SnapshotStore(root, "sync-transactions")
+
+
+def _latest_incomplete_operation(root: Path) -> tuple[Optional[SnapshotStore], Optional[Manifest]]:
+    candidates = []
+    for store in _snapshot_stores(root):
+        manifest = store.latest_incomplete()
+        if manifest is not None:
+            candidates.append((store, manifest))
+    if not candidates:
+        return None, None
+    return max(candidates, key=lambda item: item[1].created_at)
+
+
 @click.group(
     name="codelux",
     help="Unified Provider management CLI for AI coding assistants",
@@ -268,9 +283,10 @@ def _sync_locked(command: F) -> F:
             recovery = root / "recovery.json"
             if recovery.is_file() or recovery.is_symlink():
                 raise click.ClickException("recovery is required before another write operation")
-            incomplete = SnapshotStore(root).latest_incomplete()
+            store, incomplete = _latest_incomplete_operation(root)
             if incomplete is not None:
-                SnapshotStore(root).require_recovery(incomplete)
+                assert store is not None
+                store.require_recovery(incomplete)
                 raise click.ClickException(
                     f"incomplete operation {incomplete.operation_id} requires recovery"
                 )
@@ -1625,9 +1641,10 @@ def _locked(command: F) -> F:
                     load_registry(root)
                 except CodeluxError as exc:
                     raise click.ClickException(str(exc)) from exc
-                incomplete = SnapshotStore(root).latest_incomplete()
+                store, incomplete = _latest_incomplete_operation(root)
                 if incomplete is not None:
-                    SnapshotStore(root).require_recovery(incomplete)
+                    assert store is not None
+                    store.require_recovery(incomplete)
                     raise click.ClickException(
                         f"incomplete operation {incomplete.operation_id} requires recovery"
                     )
@@ -1698,7 +1715,7 @@ def status(client: str, output_format: str) -> None:
         if output_format is None:
             output_format = "table"
         names = _resolve_status_clients(client, adapters)
-        incomplete = SnapshotStore(root).latest_incomplete()
+        _, incomplete = _latest_incomplete_operation(root)
         recovery_required = (root / "recovery.json").is_file() or incomplete is not None
         rows = []
         for name in names:
@@ -2031,7 +2048,7 @@ def switch(name: str, client: str, no_shared_session: bool) -> None:
                     )
                     continue
                 try:
-                    manifest = _latest_official_manifest(store, target)
+                    manifest = _latest_official_manifest(store, target, registry)
                 except ValidationError:
                     if (
                         target == "claude"
@@ -2143,15 +2160,19 @@ def recover(operation_id: str, dry_run: bool) -> None:
     """Validate and restore files recorded by recovery.json."""
     try:
         _, _, root = _adapters()
-        store = SnapshotStore(root)
         recovery_path = root / "recovery.json"
         if not recovery_path.is_file() and not recovery_path.is_symlink():
-            incomplete = store.latest_incomplete()
+            store, incomplete = _latest_incomplete_operation(root)
             if incomplete is not None:
+                assert store is not None
                 store.require_recovery(incomplete)
         if not recovery_path.is_file() or recovery_path.is_symlink():
             raise ValidationError("no recovery is required")
         payload = json.loads(recovery_path.read_bytes())
+        backup_directory = payload.get("backup_directory", "backups")
+        if backup_directory not in {"backups", "sync-transactions"}:
+            raise ValidationError("recovery backup directory is invalid")
+        store = SnapshotStore(root, backup_directory)
         selected = operation_id or payload.get("operation_id")
         if not isinstance(selected, str) or selected != payload.get("operation_id"):
             raise ValidationError("recovery operation does not match recovery.json")
@@ -2170,46 +2191,79 @@ def recover(operation_id: str, dry_run: bool) -> None:
         raise click.ClickException(str(exc)) from exc
 
 
-def _latest_official_manifest(store: SnapshotStore, client: str) -> Manifest:
-    candidates = []
+def _latest_official_manifest(store: SnapshotStore, client: str, registry: Registry) -> Manifest:
+    login_candidates = []
+    api_key_candidates = []
     if not store.backups.exists():
         raise ValidationError(_official_snapshot_error(client, exists=False))
     for operation_dir in store.backups.iterdir():
         if not operation_dir.is_dir() or operation_dir.is_symlink():
             continue
         try:
-            manifest = store.read_manifest(operation_dir.name)
+            manifest = store.read_manifest_metadata(operation_dir.name)
         except ValidationError:
             continue
         state = manifest.before_states.get(client)
-        if state in {ConfigState.OFFICIAL_LOGIN, ConfigState.OFFICIAL_API_KEY} or (
+        if state is ConfigState.OFFICIAL_LOGIN or (
             client == "codex"
             and state is ConfigState.UNKNOWN
             and _manifest_has_codex_chatgpt_login(store, manifest)
         ):
-            candidates.append(manifest)
-    if not candidates:
-        raise ValidationError(_official_snapshot_error(client, exists=True))
-    return sorted(candidates, key=lambda item: item.created_at)[-1]
+            login_candidates.append(manifest)
+        elif state is ConfigState.OFFICIAL_API_KEY and not (
+            client == "codex" and _manifest_uses_registered_codex_key(store, manifest, registry)
+        ):
+            api_key_candidates.append(manifest)
+    for candidates in (login_candidates, api_key_candidates):
+        for manifest in sorted(candidates, key=lambda item: item.created_at, reverse=True):
+            try:
+                store.validate_manifest(manifest)
+            except ValidationError:
+                continue
+            return manifest
+    raise ValidationError(_official_snapshot_error(client, exists=True))
 
 
 def _manifest_has_codex_chatgpt_login(store: SnapshotStore, manifest: Manifest) -> bool:
+    auth = _manifest_codex_auth(store, manifest)
+    tokens = auth.get("tokens") if isinstance(auth, dict) else None
+    return (
+        isinstance(auth, dict)
+        and auth.get("auth_mode") == "chatgpt"
+        and isinstance(tokens, dict)
+        and any(tokens.values())
+    )
+
+
+def _manifest_uses_registered_codex_key(
+    store: SnapshotStore, manifest: Manifest, registry: Registry
+) -> bool:
+    auth = _manifest_codex_auth(store, manifest)
+    key = auth.get("OPENAI_API_KEY") if isinstance(auth, dict) else None
+    return isinstance(key, str) and any(
+        binding.api_key == key
+        for record in registry.providers.values()
+        for client, binding in record.clients.items()
+        if client == "codex"
+    )
+
+
+def _manifest_codex_auth(store: SnapshotStore, manifest: Manifest) -> Optional[dict[str, object]]:
     auth_file = next(
         (item for item in manifest.files if item.source_path == "codex/auth.json"),
         None,
     )
     if auth_file is None:
-        return False
+        return None
+    expected = store.backups / manifest.operation_id / "codex" / "auth.json"
+    backup = store.root / auth_file.backup_path
+    if backup != expected:
+        return None
     try:
-        auth = json.loads((store.root / auth_file.backup_path).read_bytes())
+        auth = json.loads(backup.read_bytes())
     except (OSError, json.JSONDecodeError):
-        return False
-    return (
-        isinstance(auth, dict)
-        and auth.get("auth_mode") == "chatgpt"
-        and isinstance(auth.get("tokens"), dict)
-        and any(auth["tokens"].values())
-    )
+        return None
+    return auth if isinstance(auth, dict) else None
 
 
 def _official_snapshot_error(client: str, *, exists: bool) -> str:
@@ -2238,7 +2292,7 @@ def _provider_has_history(store: SnapshotStore, provider_name: str, clients: lis
         if not operation_dir.is_dir() or operation_dir.is_symlink():
             continue
         try:
-            manifest = store.read_manifest(operation_dir.name)
+            manifest = store.read_manifest_metadata(operation_dir.name)
         except ValidationError:
             continue
         if manifest.target_provider == provider_name and selected.intersection(manifest.clients):
